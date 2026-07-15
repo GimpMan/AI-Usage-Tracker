@@ -49,7 +49,6 @@ The tracker contacts enabled providers directly and keeps the last successful re
 
 - **Refresh interval:** 30 seconds to 5 minutes; the default is 60 seconds.
 - **Provider visibility:** hide a configured provider without deleting its credentials.
-- **Compact view:** reduce the overlay height while keeping the same controls and details.
 - **Autostart:** optionally start AI Usage Tracker when you sign in to Windows.
 - **Provider order:** drag segments into a preferred order; the order is saved locally.
 - **Update channel:** choose stable releases or prerelease builds.
