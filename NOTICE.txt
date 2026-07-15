@@ -1,0 +1,11 @@
+AI Usage Tracker
+Copyright (c) 2026 Jaco. All rights reserved.
+
+AI Usage Tracker is proprietary software. Distribution of an official binary permits
+personal use of that binary only. It does not grant permission to copy, modify,
+reverse engineer, redistribute, sublicense, or sell the software except where such a
+restriction is prohibited by applicable law or the copyright holder gives written
+permission.
+
+Third-party names and trademarks belong to their respective owners. Their appearance
+does not imply endorsement.
