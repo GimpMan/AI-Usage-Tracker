@@ -2,37 +2,71 @@
 
 # AI Usage Tracker
 
-**A compact quota overlay for Windows 10/11 x64.** See remaining AI coding-plan allowance at a glance, without repeatedly opening provider dashboards.
+**A compact Windows overlay for tracking AI quotas, usage, and prepaid credits.** Keep provider limits visible while you work instead of repeatedly opening separate dashboards.
 
 ## Download
 
-[**Open the latest release and download the Windows setup EXE**](https://github.com/GimpMan/AI-Usage-Tracker/releases/latest)
+[**Download the latest Windows setup EXE**](https://github.com/GimpMan/AI-Usage-Tracker/releases/latest)
 
-The setup EXE is the supported installer. AI Usage Tracker is currently available only for 64-bit Windows 10 and Windows 11.
+AI Usage Tracker is currently distributed for **64-bit Windows 10 and Windows 11**.
 
-## Supported providers
+- The supported package is the **NSIS setup EXE**.
+- It installs for the current Windows user and does not require administrator access.
+- If Microsoft Edge WebView2 is missing, the installer can download its bootstrapper automatically.
+- Nothing is pre-authenticated: API keys, OAuth sessions, and usage history are not included in the installer.
 
-- Z.ai Coding Plan
-- MiniMax Coding Plan
-- Grok/SuperGrok
-- OpenAI Codex
-- Claude Code Pro/Max
-- OpenRouter
+The public repository contains installers and documentation only; it is not the application source repository.
+
+## What it tracks
+
+The overlay summarizes enabled and authenticated providers in a single bar. Click a provider segment to see its available windows, reset times, balance details, or local usage totals. Drag segments to reorder them or drag the overlay to reposition it.
+
+### Supported providers
+
+| Provider | Authentication | Information shown |
+| --- | --- | --- |
+| **Z.ai Coding Plan** | API key from **z.ai → Manage API Key** | 5-hour and weekly coding windows; the monthly Web Search / Reader / Zread tool quota appears in the popup. |
+| **MiniMax Coding Plan** | Coding Plan or Token Plan API key; choose **Overseas** (`minimax.io`) or **China** (`minimaxi.com`) to match the key. | 5-hour and weekly quota windows. |
+| **OpenAI Codex CLI** | Sign in with ChatGPT in Settings, or reuse the official CLI session at `~/.codex/auth.json`. No API key is required. | Live primary and secondary Codex rate-limit windows, including reset times. |
+| **Claude Code** | Sign in in Settings or use the Claude CLI at `~/.claude`. An active **Pro or Max** subscription is required. | Recent local token totals from Claude project logs. Claude does not provide a live rate-limit percentage here. |
+| **Grok (SuperGrok / Build)** | Sign in in Settings, or reuse `~/.grok/auth.json`. | The weekly SuperGrok pool and, when available, credit details in the popup. |
+| **Moonshot Kimi Code** | Sign in with Kimi Code. The shared session is stored at `~/.kimi-code/credentials/kimi-code.json` by default, or under the `KIMI_CODE_HOME` directory. No API key is required. | Kimi Code 5-hour and 7-day plan quotas. |
+| **OpenRouter** | Normal API key for per-key limits. An optional **Management key** adds account-wide balance, top-up detection, and local balance rebasing. | Daily, weekly, monthly, or lifetime key limits plus account balance when available. |
+
+Claude is only registered when the app detects an active Pro/Max subscription. Providers without usable credentials or usage data are automatically hidden from the overlay until they are configured.
 
 ## Install and first use
 
-1. Download and run the setup EXE. The installer can add Microsoft Edge WebView2 if it is missing.
-2. Windows SmartScreen may show an “unrecognized app” warning because the installer is not Authenticode-signed. Confirm that the file came from this repository’s Releases page, choose **More info**, then **Run anyway** if you want to continue.
-3. Open the gear button on the overlay, enable a provider, and follow its authentication instructions.
-4. The overlay refreshes periodically. Click it for details or use the tray icon to open, hide, or quit.
+1. Download and run the setup EXE from [Releases](https://github.com/GimpMan/AI-Usage-Tracker/releases/latest).
+2. If Windows SmartScreen warns that the publisher is unrecognized, confirm that the installer came from this repository’s Releases page. The setup EXE is not Authenticode-signed.
+3. Open the **gear** button on the overlay and enable a provider.
+4. Sign in, paste an API key, or select the MiniMax region as indicated in Settings.
+5. Click a segment for details. Use the tray icon to open, hide, or quit the app.
 
-Updates are delivered through the app’s signed updater. When an update is available, the app asks before installing it; updater signatures protect the package even though the installer has no Authenticode certificate.
+The tracker contacts enabled providers directly and keeps the last successful reading visible through transient network failures. It does not increase quotas; it helps you see and pace the allowance you already have.
 
-## Privacy and help
+## Settings and updates
 
-There is no telemetry. Credentials remain in Windows Credential Manager or the local files used by official provider CLIs, and usage requests go directly to providers. Read the full [Privacy Policy](PRIVACY.md).
+- **Refresh interval:** 30 seconds to 5 minutes; the default is 60 seconds.
+- **Provider visibility:** hide a configured provider without deleting its credentials.
+- **Compact view:** reduce the overlay height while keeping the same controls and details.
+- **Autostart:** optionally start AI Usage Tracker when you sign in to Windows.
+- **Provider order:** drag segments into a preferred order; the order is saved locally.
+- **Update channel:** choose stable releases or prerelease builds.
 
-For troubleshooting and issue reports, see [Support](SUPPORT.md). Security researchers should follow the [Security Policy](SECURITY.md).
+The app checks for updates automatically once a day and also supports a manual check. Updates are downloaded from GitHub and verified with the app’s signed updater package before installation; installation is always user-initiated. The updater signature is separate from Windows Authenticode signing, so SmartScreen may still warn on a fresh installer.
+
+## Privacy and local data
+
+AI Usage Tracker has **no telemetry, advertising, analytics, crash-reporting service, or developer server**.
+
+- API keys are stored in **Windows Credential Manager**.
+- OAuth sessions are stored locally in the provider files used by the relevant official CLIs; Kimi Code shares its official credential-file format.
+- Preferences, provider visibility, overlay position, refresh settings, and usage snapshots stay in the Windows user profile.
+- The app contacts enabled providers directly to authenticate and retrieve usage data. It also contacts GitHub for update checks and downloads.
+- Usage data is not routed through a server operated by the AI Usage Tracker developer.
+
+Read the full [Privacy Policy](PRIVACY.md), [Support guide](SUPPORT.md), and [Security Policy](SECURITY.md). Never post API keys, OAuth tokens, credential files, or unredacted account details in an issue.
 
 ## License status
 
