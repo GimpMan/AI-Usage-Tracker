@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/ai-usage-tracker-banner.png" width="340" alt="AI Usage Tracker quota dashboard artwork"></p>
+<p align="center"><img src="assets/ai-usage-tracker-banner.png?v=62fa9ec" width="740" alt="AI Usage Tracker"></p>
 
 # AI Usage Tracker
 
