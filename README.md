@@ -1,16 +1,25 @@
 <p align="center"><img src="assets/ai-usage-tracker-banner.png?v=62fa9ec" width="740" alt="AI Usage Tracker"></p>
 
-# AI Usage Tracker
+<h1 align="center">AI Usage Tracker</h1>
 
-<table>
-  <tr>
-    <td valign="top">
-      <h3>A compact Windows overlay for tracking AI quotas, usage, and prepaid credits.</h3>
-      <p>Keep provider limits visible while you work instead of repeatedly opening separate dashboards.</p>
-    </td>
-    <td valign="top" align="center"><img src="assets/demo.gif" width="440" alt="AI Usage Tracker demo"></td>
-  </tr>
-</table>
+<p align="center">
+  <strong>Always-on Windows overlay for AI rate limits, quotas, and prepaid credits.</strong><br>
+  See remaining allowance for Z.ai, MiniMax, Codex, Claude, Grok, Kimi Code, and OpenRouter — without jumping between dashboards.
+</p>
+
+<p align="center">
+  <a href="#download">Download</a>
+  ·
+  <a href="#what-it-tracks">What it tracks</a>
+  ·
+  <a href="PRIVACY.md">Privacy</a>
+  ·
+  <a href="SUPPORT.md">Support</a>
+</p>
+
+<p align="center">
+  <img src="assets/demo.gif" width="720" alt="AI Usage Tracker demo">
+</p>
 
 ## Download
 
