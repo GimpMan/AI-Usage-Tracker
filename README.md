@@ -37,7 +37,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/demo.gif?v=20260716-hq" width="720" alt="AI Usage Tracker demo">
+  <img src="assets/demo-hq.gif" width="720" alt="AI Usage Tracker demo">
 </p>
 
 ---
