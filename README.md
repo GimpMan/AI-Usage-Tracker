@@ -2,9 +2,12 @@
 
 # AI Usage Tracker
 
-**A compact Windows overlay for tracking AI quotas, usage, and prepaid credits.** Keep provider limits visible while you work instead of repeatedly opening separate dashboards.
-
-<p align="center"><img src="assets/demo.gif" width="320" alt="AI Usage Tracker demo"></p>
+<table>
+  <tr>
+    <td valign="top"><strong>A compact Windows overlay for tracking AI quotas, usage, and prepaid credits.</strong> Keep provider limits visible while you work instead of repeatedly opening separate dashboards.</td>
+    <td valign="top" align="center"><img src="assets/demo.gif" width="320" alt="AI Usage Tracker demo"></td>
+  </tr>
+</table>
 
 ## Download
 
