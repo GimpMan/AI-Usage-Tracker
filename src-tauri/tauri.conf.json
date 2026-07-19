@@ -1,0 +1,56 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AI Usage Tracker",
+  "version": "0.7.31",
+  "identifier": "com.aiusagetracker.desktop",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data: asset: https://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "nsis",
+    "createUpdaterArtifacts": true,
+    "publisher": "AI Usage Tracker",
+    "category": "Utility",
+    "shortDescription": "Track AI coding-plan usage on Windows",
+    "longDescription": "Windows overlay that shows remaining rate-limit quota for Grok, Claude, Codex, MiniMax Coding Plan, and Z.ai Coding Plan. API keys stay in Windows Credential Manager; OAuth tokens use the same local files as the official CLIs.",
+    "copyright": "Copyright (c) 2026 AI Usage Tracker contributors",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "displayLanguageSelector": false,
+        "startMenuFolder": "AI Usage Tracker"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI4RDNCQzhBQkUzREVFMjUKUldRbDdqMitpcnpUS0VjSVRqcXJZRUdVYnNiU01QM2hWQVlIVWIyK013cFd5TzR3bFA3WURwY0IK",
+      "endpoints": [
+        "https://github.com/GimpMan/AI-Usage-Tracker/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

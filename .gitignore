@@ -1,0 +1,45 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+
+.vite/
+*.log
+.DS_Store
+*.pem
+*.p12
+*.pfx
+*.key
+.env
+.env.*
+auth.json
+config.json
+credentials.json
+state.json
+.tauri/
+Thumbs.db
+
+# Local release staging (optional)
+release/
+
+# IDE / agent tooling (local, not part of the app)
+mcps/
+.opencode/
+terminals/
+
+# Isolated implementation worktrees
+.worktrees/
+.superpowers/
+
+# Local-only standalone release-helper project; never commit or publish with the app.
+release-builder/
+
+# Local AI/agent notes and plans
+.agents/
+.claude/
+.codex/
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+docs/superpowers/
+plans/
