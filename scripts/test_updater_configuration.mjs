@@ -10,9 +10,12 @@ const capability = readJson("src-tauri/capabilities/default.json");
 const gitignore = fs.readFileSync(".gitignore", "utf8");
 const checksWorkflow = fs.readFileSync(".github/workflows/checks.yml", "utf8");
 const releaseWorkflow = fs.readFileSync(".github/workflows/release.yml", "utf8");
+const cargoVersion = cargoToml.match(/^version = "([^"]+)"/m)?.[1];
 
 assert(packageJson.dependencies?.["@tauri-apps/plugin-updater"], "missing JS updater plugin");
 assert(packageJson.dependencies?.["@tauri-apps/plugin-process"], "missing JS process plugin");
+assert.equal(cargoVersion, packageJson.version, "Cargo and npm versions must match");
+assert.equal(config.version, packageJson.version, "Tauri and npm versions must match");
 assert(
   Object.keys(packageJson.scripts ?? {}).every((name) => !/release|package/i.test(name)),
   "local package scripts must not publish releases",
