@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
-import type { ProviderId, ProviderStatus, UpdateChannel } from "./types";
+import type { ProviderId, ProviderStatus } from "./types";
 import { checkboxDisabled } from "./provider-visibility";
 import {
   cancelOauthLogin,
@@ -30,7 +30,6 @@ import {
   setNotificationsEnabled,
   setProviderHidden,
   setRefreshInterval,
-  setUpdateChannel,
   startOauthLogin,
   testKey,
   testOpenrouterManagementKey,
@@ -1385,12 +1384,10 @@ function ReleaseNotes({ notes }: { notes: string }) {
 function UpdatesSection() {
   const state = useUpdateState();
   const [actionError, setActionError] = useState<string | null>(null);
-  const [channelBusy, setChannelBusy] = useState(false);
   const phase = state?.phase ?? "idle";
   // Keep all backend phases explicit so additions cannot silently inherit an
   // unsafe control state.
   const busy = phase === "checking" || phase === "downloading" || phase === "installing";
-  const channel = state?.channel ?? "stable";
   const statusText: Record<typeof phase, string> = {
     "idle": "Updates are checked automatically once a day.",
     "checking": "Checking for updates…",
@@ -1419,20 +1416,6 @@ function UpdatesSection() {
     }
   }
 
-  async function onChannelChange(next: UpdateChannel) {
-    if (next === channel) return;
-    setActionError(null);
-    setChannelBusy(true);
-    try {
-      await setUpdateChannel(next);
-    } catch (error) {
-      console.error("Update channel change failed", error);
-      setActionError("Could not change update channel. Please try again.");
-    } finally {
-      setChannelBusy(false);
-    }
-  }
-
   const shownError = actionError ?? state?.error;
   const progressPercent = clampUpdateProgressPercent(
     state?.downloaded_bytes ?? 0,
@@ -1450,24 +1433,6 @@ function UpdatesSection() {
         <div><dt>Last successful check</dt><dd>{formatUpdateDate(state?.last_checked_at)}</dd></div>
         {state?.available_version && <div><dt>Available version</dt><dd>{state.available_version}</dd></div>}
       </dl>
-      <div class="update-channel-row">
-        <label class="update-channel-label" for="update-channel">Update channel</label>
-        <select
-          id="update-channel"
-          class="update-channel-select"
-          aria-label="Update channel"
-          value={channel}
-          disabled={busy || channelBusy}
-          onChange={(e) =>
-            void onChannelChange((e.target as HTMLSelectElement).value as UpdateChannel)
-          }
-        >
-          <option value="stable">Stable releases</option>
-        </select>
-      </div>
-      <div class="hint update-channel-hint">
-        Stable releases: main releases only.
-      </div>
       <div class="hint" role="status" aria-live="polite">{statusText[phase]}</div>
       {(phase === "downloading" || phase === "installing") && (
         <div class="update-progress">
@@ -1478,11 +1443,11 @@ function UpdatesSection() {
       {state?.notes && phase === "available" && <ReleaseNotes notes={state.notes} />}
       {shownError && <div class="update-error" role="alert">{shownError}</div>}
       <div class="action-row update-actions">
-        <button class="action secondary" disabled={busy || channelBusy} onClick={() => void onCheck()}>
+        <button class="action secondary" disabled={busy} onClick={() => void onCheck()}>
           {phase === "error" ? "Retry" : "Check for updates"}
         </button>
         {phase === "available" && (
-          <button class="action" disabled={busy || channelBusy} onClick={() => void onInstall()}>
+          <button class="action" disabled={busy} onClick={() => void onInstall()}>
             Install update and restart
           </button>
         )}

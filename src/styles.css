@@ -1953,31 +1953,3 @@ button.action:disabled {
   background: rgba(137, 180, 250, 0.08);
   text-decoration: underline;
 }
-.update-channel-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin: 0 0 4px;
-}
-.update-channel-label {
-  font-size: 11px;
-  color: var(--fg-dim);
-}
-.update-channel-select {
-  background: var(--bg-base);
-  border: 1px solid var(--border-strong);
-  border-radius: 5px;
-  padding: 3px 8px;
-  color: var(--fg);
-  font-size: 11px;
-  height: 24px;
-  cursor: pointer;
-}
-.update-channel-select:disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
-}
-.update-channel-hint {
-  margin: 0 0 8px;
-}

@@ -44,26 +44,9 @@ assert.equal(clampUpdateProgressPercent(-5, 100), 0);
 assert.equal(clampUpdateProgressPercent(25, 0), 0);
 assert.equal(clampUpdateProgressPercent(Number.NaN, 100), 0);
 
-// Update channel selector (Settings > Updates)
-assert.match(ui, /Update channel/, "missing accessible Update channel label");
-assert.match(ui, /Stable releases/, "missing Stable releases choice");
+// Updates section (Settings > Updates): no channel selector — always stable.
+assert.doesNotMatch(ui, /Update channel/, "update channel selector should be removed");
+assert.doesNotMatch(ui, /setUpdateChannel/, "frontend must not call setUpdateChannel");
 assert.doesNotMatch(ui, /Prerelease builds/, "prerelease choice should be removed");
-assert.match(
-  ui,
-  /main releases only|stable releases only|published, non-draft|non-prerelease/i,
-  "copy must clarify stable = main/stable releases only",
-);
-assert.match(ui, /setUpdateChannel\s*\(/, "channel selector must call setUpdateChannel");
-assert.match(
-  ui,
-  /disabled=\{[^}]*busy|channelBusy|channelChanging|changingChannel/,
-  "channel selector must disable during update activity or channel changes",
-);
-assert.match(
-  ui,
-  /aria-label=["']Update channel["']|htmlFor=["'][^"']*update-channel|id=["']update-channel/,
-  "Update channel control must be accessible (label/id/aria-label)",
-);
-assert.match(ui, /["']stable["']/, "selector must use stable channel value");
 
 console.log("update settings UI checks passed");
