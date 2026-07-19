@@ -47,16 +47,11 @@ assert.equal(clampUpdateProgressPercent(Number.NaN, 100), 0);
 // Update channel selector (Settings > Updates)
 assert.match(ui, /Update channel/, "missing accessible Update channel label");
 assert.match(ui, /Stable releases/, "missing Stable releases choice");
-assert.match(ui, /Prerelease builds/, "missing Prerelease builds choice");
+assert.doesNotMatch(ui, /Prerelease builds/, "prerelease choice should be removed");
 assert.match(
   ui,
   /main releases only|stable releases only|published, non-draft|non-prerelease/i,
   "copy must clarify stable = main/stable releases only",
-);
-assert.match(
-  ui,
-  /prerelease builds only|prerelease only|prerelease-only/i,
-  "copy must clarify prerelease = prerelease builds only",
 );
 assert.match(ui, /setUpdateChannel\s*\(/, "channel selector must call setUpdateChannel");
 assert.match(
@@ -70,6 +65,5 @@ assert.match(
   "Update channel control must be accessible (label/id/aria-label)",
 );
 assert.match(ui, /["']stable["']/, "selector must use stable channel value");
-assert.match(ui, /["']prerelease["']/, "selector must use prerelease channel value");
 
 console.log("update settings UI checks passed");

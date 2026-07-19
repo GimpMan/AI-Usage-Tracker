@@ -1463,11 +1463,10 @@ function UpdatesSection() {
           }
         >
           <option value="stable">Stable releases</option>
-          <option value="prerelease">Prerelease builds</option>
         </select>
       </div>
       <div class="hint update-channel-hint">
-        Stable releases: main releases only. Prerelease builds: prerelease builds only.
+        Stable releases: main releases only.
       </div>
       <div class="hint" role="status" aria-live="polite">{statusText[phase]}</div>
       {(phase === "downloading" || phase === "installing") && (
