@@ -39,14 +39,6 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked
 
 GitHub Actions runs the same checks for pushes and pull requests to `main`.
 
-## Releases
-
-Set `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` as
-GitHub Actions secrets. After updating the version in `package.json`,
-`src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json`, push a matching tag
-such as `v0.7.32`. GitHub Actions builds the signed NSIS installer, updater
-artifacts, and release notes.
-
 ## License
 
 [MIT](LICENSE)
