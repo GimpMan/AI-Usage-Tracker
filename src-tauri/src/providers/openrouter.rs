@@ -91,24 +91,9 @@ pub async fn rebase_account(api_key: &str) -> Result<String, String> {
         return Err("no account balance returned".into());
     };
     let remaining = (total - used).max(0.0);
-    AccountBalanceBaseline::save(
-        MANAGEMENT_KEY_ID,
-        AccountBalanceBaseline {
-            balance: remaining,
-            saved_at: Utc::now(),
-            extra: serde_json::Map::new(),
-        },
-    )?;
-    // Pin total_credits too so the next scheduled fetch doesn't treat the
-    // current total as a top-up and auto-reset the rebase.
-    TopupBaseline::save(
-        MANAGEMENT_KEY_ID,
-        TopupBaseline {
-            total_credits: total,
-            saved_at: Utc::now(),
-            extra: serde_json::Map::new(),
-        },
-    )?;
+    // Save both baselines atomically so a concurrent scheduled fetch can't
+    // read one new baseline + one stale one and clobber the rebase.
+    crate::secrets::save_openrouter_baselines(total, remaining)?;
     Ok(format!("Account balance rebased to ${remaining:.2}"))
 }
 
@@ -1156,5 +1141,72 @@ mod tests {
         let snap = build_snapshot(Some(&key), None, None);
 
         assert!(snap.windows.is_empty());
+    }
+
+    /// Regression: after a rebase, subsequent fetches must track spending
+    /// relative to the rebase baseline — not revert to 0% used (which looks
+    /// like "100% available"). This was caused by a race where the scheduled
+    /// fetch clobbered the rebase's baselines. The fix makes the rebase save
+    /// atomically + holds the fetch lock, but the snapshot logic itself must
+    /// also be correct: with proper baselines, spending shows up.
+    #[test]
+    fn rebased_balance_tracks_spending_not_revert_to_zero() {
+        // User rebased when remaining was $7.00 (total=111, used=104).
+        let credit_data = credits(111.0, 104.0); // remaining = 7.00
+        let account_prev = AccountBalanceBaseline {
+            balance: 7.0,
+            saved_at: Utc::now(),
+            extra: serde_json::Map::new(),
+        };
+        let topup_prev = TopupBaseline {
+            total_credits: 111.0,
+            saved_at: Utc::now(),
+            extra: serde_json::Map::new(),
+        };
+
+        let snap = build_snapshot_with_account_baseline(
+            None,
+            Some(&credit_data),
+            Some(topup_prev),
+            Some(account_prev),
+            false,
+        );
+        let balance = snap
+            .windows
+            .iter()
+            .find(|w| w.label.starts_with("balance "))
+            .expect("balance window");
+        // effective_total = 7.0 (rebase), remaining = 7.0 → 0% used. Correct
+        // at the moment of rebase.
+        assert!(balance.used_percent.abs() < f32::EPSILON);
+
+        // Now the user spends $1.00: total_usage rises from 104 to 105.
+        let credit_data_after_spend = credits(111.0, 105.0); // remaining = 6.00
+        let snap2 = build_snapshot_with_account_baseline(
+            None,
+            Some(&credit_data_after_spend),
+            Some(TopupBaseline {
+                total_credits: 111.0,
+                saved_at: Utc::now(),
+                extra: serde_json::Map::new(),
+            }),
+            Some(AccountBalanceBaseline {
+                balance: 7.0,
+                saved_at: Utc::now(),
+                extra: serde_json::Map::new(),
+            }),
+            false,
+        );
+        let balance2 = snap2
+            .windows
+            .iter()
+            .find(|w| w.label.starts_with("balance "))
+            .expect("balance window after spend");
+        // effective_total = 7.0 (rebase), remaining = 6.0 → used = 1.0 → ~14.3%.
+        assert!(
+            (balance2.used_percent - 14.28).abs() < 0.1,
+            "expected ~14.3% used after spending $1 of $7 rebase, got {}%",
+            balance2.used_percent
+        );
     }
 }

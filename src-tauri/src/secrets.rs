@@ -372,6 +372,32 @@ impl AccountBalanceBaseline {
     }
 }
 
+/// Save both OpenRouter baselines (top-up + account balance) in a single
+/// atomic config write. This eliminates the window between two separate saves
+/// where a concurrent fetch could read one new baseline and one stale one.
+pub fn save_openrouter_baselines(
+    total_credits: f64,
+    balance: f64,
+) -> Result<(), String> {
+    update_app_config(|config| {
+        let entry = config
+            .providers
+            .entry("openrouter_management".to_string())
+            .or_default();
+        entry.topup_baseline = Some(TopupBaseline {
+            total_credits,
+            saved_at: Utc::now(),
+            extra: serde_json::Map::new(),
+        });
+        entry.account_balance_baseline = Some(AccountBalanceBaseline {
+            balance,
+            saved_at: Utc::now(),
+            extra: serde_json::Map::new(),
+        });
+    })
+    .map_err(|e| e.to_string())
+}
+
 /// Preferred updater channel. Serialized exactly as `stable` / `prerelease`.
 /// Legacy configs without this field default to stable.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

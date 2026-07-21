@@ -406,12 +406,20 @@ pub async fn test_openrouter_management_key(key: Option<String>) -> Result<Strin
 
 #[tauri::command]
 pub async fn rebase_openrouter_account(
+    app: tauri::AppHandle,
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<String, String> {
     let key = Secrets
         .get("openrouter_management")
         .ok_or_else(|| "openrouter management key: no key provided".to_string())?;
-    let message = crate::providers::openrouter::rebase_account(&key).await?;
+    // Hold the provider fetch lock so a scheduled refresh can't read stale
+    // baselines mid-rebase and then clobber the rebase when it writes.
+    let message = crate::scheduler::with_provider_fetch_lock(
+        "openrouter",
+        Some(&app),
+        crate::providers::openrouter::rebase_account(&key),
+    )
+    .await?;
     state.health.write().await.remove("openrouter");
     Ok(message)
 }
