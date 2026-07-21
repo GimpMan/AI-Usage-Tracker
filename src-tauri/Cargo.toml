@@ -1,6 +1,6 @@
 [package]
 name = "ai-usage-tracker"
-version = "0.7.61"
+version = "0.7.71"
 description = "AI Usage Tracker"
 authors = ["AI Usage Tracker contributors"]
 license = "MIT"
