@@ -137,7 +137,7 @@ assert.doesNotMatch(
 );
 assert.match(
   overlaySource,
-  /const providerSignature = snaps\s*\.filter\([\s\S]*?isStaleSnapshot[\s\S]*?hasDisplayableWindows[\s\S]*?\.map\(\(snap\) => snap\.provider\)/,
+  /const providerSignature = snaps\s*\.filter\(\(snap\) => barSegmentVisible\(snap, staleThreshold\)\)\s*\.map\(\(snap\) => snap\.provider\)/,
   "width remeasure must key off bar-visible trackers (stale rehydrate → live)",
 );
 assert.match(

@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import {
+  barSegmentVisible,
   checkboxChecked,
   checkboxDisabled,
   hasDisplayableWindows,
   formatBalanceWindow,
   formatDollarWindow,
 } from "../src/provider-visibility.ts";
+import { staleThresholdMs } from "../src/stale-snapshot.ts";
 
 assert.equal(checkboxChecked({ eligible: true, hidden: false }), true);
 assert.equal(checkboxChecked({ eligible: false, hidden: false }), false);
@@ -20,6 +22,37 @@ assert.equal(
 assert.equal(
   hasDisplayableWindows({ windows: [{ bar_visible: true }] }),
   true,
+);
+
+// barSegmentVisible: the stale-age hide is for startup rehydrate only. A
+// last-good snapshot stamped with unavailable_reason (live-session fetch
+// failure — never persisted to state.json) must keep its segment, rendering
+// the "stale" badge, instead of silently vanishing while Settings still
+// shows the provider as selected.
+const threshold = staleThresholdMs(60);
+const barWindow = { label: "5h", used_percent: 10, reset_at: null, bar_visible: true, is_unlimited: false };
+const freshSnap = {
+  windows: [barWindow],
+  unavailable_reason: null,
+  fetched_at: new Date(Date.now() - 10_000).toISOString(),
+};
+const staleRehydrate = {
+  ...freshSnap,
+  fetched_at: new Date(Date.now() - 3_600_000).toISOString(),
+};
+const staleWithReason = { ...staleRehydrate, unavailable_reason: "transport: timeout" };
+
+assert.equal(barSegmentVisible(freshSnap, threshold), true, "fresh snapshot shows");
+assert.equal(barSegmentVisible(staleRehydrate, threshold), false, "stale rehydrate hides");
+assert.equal(
+  barSegmentVisible(staleWithReason, threshold),
+  true,
+  "reason-stamped last-good stays visible regardless of age",
+);
+assert.equal(
+  barSegmentVisible({ ...staleWithReason, windows: [{ ...barWindow, bar_visible: false }] }, threshold),
+  false,
+  "no bar-visible windows hides even with a reason",
 );
 assert.equal(
   formatBalanceWindow({ label: "balance $12.40" }),
@@ -61,7 +94,7 @@ assert.match(settingsSource, /saveOpenrouterManagementKey/);
 assert.match(settingsSource, /Management API Key/);
 assert.match(settingsSource, /Rebase account balance/);
 assert.match(apiSource, /rebaseOpenrouterAccount/);
-assert.match(overlaySource, /hasDisplayableWindows/);
+assert.match(overlaySource, /barSegmentVisible/);
 assert.match(overlaySource, /formatDollarWindow/);
 
 assert.match(

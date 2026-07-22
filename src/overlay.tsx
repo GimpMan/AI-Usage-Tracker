@@ -19,7 +19,7 @@ import {
 import type { ProviderId } from "./types";
 import { collapsedBarRemaining, collapsedBarColorPercent, isWeeklyUnderRedLine, isWeeklyWindowUnderRedLine, isFiveHourWindowUnderRedLine, isFiveHourUnderRedLine } from "./bar-summary";
 import { burnBarHeights, burnBarTitle, bucketSecsForLabel, burnedTodayPercent, hasBurnHistory } from "./burn-bars.ts";
-import { formatDollarWindow, hasDisplayableWindows } from "./provider-visibility";
+import { barSegmentVisible, formatDollarWindow } from "./provider-visibility";
 import { normalizeProviderOrder, reorderProviderOrder } from "./provider-order";
 import {
   normalizeRefreshIntervalSecs,
@@ -29,7 +29,6 @@ import {
 } from "./refresh-countdown";
 import {
   DEFAULT_REFRESH_INTERVAL_SECS,
-  isStaleSnapshot,
   staleThresholdMs,
 } from "./stale-snapshot";
 import {
@@ -923,7 +922,7 @@ function Bar({
         </div>
       )}
 
-      {ordered.filter((s) => !isStaleSnapshot(s, staleThreshold) && hasDisplayableWindows(s)).map((snap) => {
+      {ordered.filter((s) => barSegmentVisible(s, staleThreshold)).map((snap) => {
         const id = snap.provider;
         const iconId = iconIdFor(id);
         const isActive = activeId === id;
@@ -2592,10 +2591,7 @@ export function Overlay() {
   // paint has zero segments; when live fetches land the same providers become
   // visible and this signature must change so we remeasure and expand.
   const providerSignature = snaps
-    .filter(
-      (snap) =>
-        !isStaleSnapshot(snap, staleThreshold) && hasDisplayableWindows(snap),
-    )
+    .filter((snap) => barSegmentVisible(snap, staleThreshold))
     .map((snap) => snap.provider)
     .join("\u001f");
   useEffect(() => {
