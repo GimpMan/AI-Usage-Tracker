@@ -2,7 +2,10 @@
 //!
 //! Auth: app OAuth session in Windows Credential Manager (`oauth_grok`).
 //! Legacy `~/.grok/auth.json` is imported once if CM is empty; the app never
-//! writes that CLI file.
+//! writes that CLI file. Because xAI rotates refresh tokens on use and the
+//! CLI shares the same lineage, a rejected app refresh falls back to
+//! re-importing the CLI file's fresher session once (see
+//! `cli_fallback_session`).
 //! Usage (same host the Grok Build CLI uses):
 //! - `GET .../v1/billing` — calendar-month included dollar pool
 //! - `GET .../v1/billing?format=credits` — unified weekly SuperGrok percent
@@ -294,10 +297,38 @@ async fn refresh_current_token(
     let _guard = lock.lock().await;
     let current = load_auth_session()?;
     if should_refresh(&current, observed_access_token, reason, Utc::now()) {
-        refresh_access_token(client, &current).await
+        match refresh_access_token(client, &current).await {
+            Ok(token) => Ok(token),
+            Err(e) => match cli_fallback_session(&current) {
+                Some(fallback) => refresh_access_token(client, &fallback).await,
+                None => Err(e),
+            },
+        }
     } else {
         Ok(current.access_token)
     }
+}
+
+/// xAI rotates refresh tokens on every use, and the Grok CLI shares the same
+/// lineage as the session this app imported. Once the CLI refreshes, the app's
+/// stored refresh token is dead while `~/.grok/auth.json` holds the live one —
+/// so when our refresh is rejected, pick up the fresher CLI session and retry
+/// once instead of declaring the session expired.
+///
+/// Sign-out safety: this only runs while a Credential Manager session exists
+/// (the failed session came from it), and storing a session clears the
+/// no-import tombstone, so an explicit in-app sign-out — which deletes the
+/// session — can never be resurrected through this path.
+fn cli_fallback_session(failed: &AuthSession) -> Option<AuthSession> {
+    let text = std::fs::read_to_string(auth_path().ok()?).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    let map = value.as_object()?.clone();
+    let session = select_auth_session(map).ok()?;
+    // Same lineage we already failed with — nothing new to try.
+    if session.refresh_token == failed.refresh_token {
+        return None;
+    }
+    Some(session)
 }
 
 async fn load_bearer(client: &reqwest::Client) -> Result<String, String> {
@@ -551,7 +582,6 @@ fn build_windows(
 
 fn weekly_window(credits: Option<&BillingConfig>) -> Option<UsageWindow> {
     let cfg = credits?;
-    let used_percent = cfg.credit_usage_percent? as f32;
     // Accept weekly periods and the bare percent when period type is absent
     // (some proxies omit type but still return a weekly end date).
     let period = cfg.current_period.as_ref();
@@ -562,6 +592,14 @@ fn weekly_window(credits: Option<&BillingConfig>) -> Option<UsageWindow> {
     if !is_weekly {
         return None;
     }
+    // A freshly rolled weekly period omits creditUsagePercent while usage is
+    // still zero — keep the window at 0% instead of dropping the weekly row
+    // until the first usage event of the new period.
+    let used_percent = match cfg.credit_usage_percent {
+        Some(p) => p as f32,
+        None if period.is_some() => 0.0,
+        None => return None,
+    };
     let reset_at = credits_reset_at(cfg);
 
     Some(UsageWindow {
@@ -972,6 +1010,100 @@ mod tests {
                     .with_timezone(&Utc)
             )
         );
+    }
+
+    /// Live payload captured 2026-07-23 right after the weekly roll: a fresh
+    /// period omits `creditUsagePercent` entirely while usage is zero. The
+    /// weekly window must survive at 0% — dropping it made the bar lose the
+    /// weekly row after every reset.
+    #[test]
+    fn weekly_window_defaults_to_zero_when_fresh_period_omits_percent() {
+        let cfg: BillingConfig = serde_json::from_value(json!({
+            "currentPeriod": {
+                "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "start": "2026-07-23T15:31:37.506066+00:00",
+                "end": "2026-07-30T15:31:37.506066+00:00"
+            },
+            "onDemandCap": { "val": 0 },
+            "onDemandUsed": { "val": 0 },
+            "isUnifiedBillingUser": true,
+            "prepaidBalance": { "val": 0 },
+            "billingPeriodStart": "2026-07-23T15:31:37.506066+00:00",
+            "billingPeriodEnd": "2026-07-30T15:31:37.506066+00:00"
+        }))
+        .expect("fresh-period fixture");
+
+        let w = weekly_window(Some(&cfg)).expect("weekly window kept at 0%");
+        assert_eq!(w.used_percent, 0.0);
+        assert!(w.bar_visible);
+        assert_eq!(
+            w.reset_at,
+            Some(
+                DateTime::parse_from_rfc3339("2026-07-30T15:31:37.506066+00:00")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
+    }
+
+    /// Without a percent AND without a period there is nothing to anchor the
+    /// window to — keep dropping it (pre-existing behavior).
+    #[test]
+    fn weekly_window_still_dropped_without_percent_or_period() {
+        let cfg: BillingConfig = serde_json::from_value(json!({
+            "billingPeriodEnd": "2026-08-01T00:00:00+00:00"
+        }))
+        .expect("bare fixture");
+        assert!(weekly_window(Some(&cfg)).is_none());
+    }
+
+    /// A non-weekly period never produces a weekly window, even when the
+    /// percent is missing (the default-0 rule is weekly-only).
+    #[test]
+    fn weekly_window_dropped_for_non_weekly_period_without_percent() {
+        let cfg: BillingConfig = serde_json::from_value(json!({
+            "currentPeriod": {
+                "type": "USAGE_PERIOD_TYPE_MONTHLY",
+                "end": "2026-08-01T00:00:00+00:00"
+            }
+        }))
+        .expect("monthly-period fixture");
+        assert!(weekly_window(Some(&cfg)).is_none());
+    }
+
+    /// The CLI-lineage fallback only engages when the CLI file holds a
+    /// different session than the one whose refresh just failed — same
+    /// refresh token means nothing new to try.
+    #[test]
+    fn cli_fallback_skips_the_same_lineage() {
+        let failed = AuthSession {
+            entry_key: "https://auth.x.ai::client".into(),
+            access_token: "old-access".into(),
+            refresh_token: Some("shared-refresh".into()),
+            client_id: "client".into(),
+            expires_at: None,
+        };
+        let same: Map<String, Value> = serde_json::from_value(json!({
+            "https://auth.x.ai::client": {
+                "key": "cli-access",
+                "auth_mode": "oidc",
+                "refresh_token": "shared-refresh"
+            }
+        }))
+        .unwrap();
+        let cli = select_auth_session(same).expect("cli session");
+        assert_eq!(cli.refresh_token, failed.refresh_token);
+
+        let fresher: Map<String, Value> = serde_json::from_value(json!({
+            "https://auth.x.ai::client": {
+                "key": "cli-access",
+                "auth_mode": "oidc",
+                "refresh_token": "rotated-refresh"
+            }
+        }))
+        .unwrap();
+        let cli = select_auth_session(fresher).expect("fresher cli session");
+        assert_ne!(cli.refresh_token, failed.refresh_token);
     }
 
     /// `productUsage[]` becomes popup-only rows: "GrokBuild" → "Build",
