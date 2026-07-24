@@ -112,10 +112,14 @@ async fn fetch_quota(api_key: &str) -> UsageSnapshot {
 
     // Pitfall C (part 2): BFF returns 200 with success=false for auth/quota errors.
     if !payload.success || payload.code != 200 {
-        return UsageSnapshot::unavailable(
-            PROVIDER_LABEL,
-            payload.msg.unwrap_or_else(|| "unknown error".into()),
-        );
+        let msg = payload.msg.unwrap_or_else(|| "unknown error".into());
+        // Ended/expired Coding Plan: the key stays valid but the account has
+        // no plan, so remaining quota really is zero. Show 0% left instead of
+        // freezing the last-good percentages, which read as "quota remains".
+        if is_plan_ended(&msg) {
+            return plan_ended_snapshot(msg);
+        }
+        return UsageSnapshot::unavailable(PROVIDER_LABEL, msg);
     }
 
     let data = match payload.data {
@@ -188,6 +192,39 @@ async fn fetch_quota(api_key: &str) -> UsageSnapshot {
         level: data.level,
         windows,
         unavailable_reason: None,
+        fetched_at: Utc::now(),
+    }
+}
+
+/// The BFF reports an ended/expired Coding Plan with a "…coding plan"
+/// message (observed live: "当前用户不存在coding plan", business code 500).
+/// The text varies with account locale; the English substring is stable.
+fn is_plan_ended(msg: &str) -> bool {
+    msg.to_ascii_lowercase().contains("coding plan")
+}
+
+/// Zeroed-out windows for an ended plan: 0% remaining on the bar windows,
+/// with the upstream message kept as the unavailable reason so the stale
+/// badge tooltip explains why. Classifies as transient-with-snapshot, so the
+/// bar updates to zero immediately and recovers on its own if the user
+/// re-subscribes.
+fn plan_ended_snapshot(reason: String) -> UsageSnapshot {
+    fn zeroed(label: &str) -> UsageWindow {
+        UsageWindow {
+            label: label.into(),
+            used_percent: 100.0,
+            reset_at: None,
+            bar_visible: true,
+            is_unlimited: false,
+            used_absolute: None,
+            limit_absolute: None,
+        }
+    }
+    UsageSnapshot {
+        provider: PROVIDER_LABEL.to_string(),
+        level: None,
+        windows: vec![zeroed("5h"), zeroed("weekly")],
+        unavailable_reason: Some(reason),
         fetched_at: Utc::now(),
     }
 }
@@ -315,6 +352,39 @@ struct ApiLimit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_ended_detection_matches_chinese_and_english_messages() {
+        // Live capture 2026-07-23 (expired GLM Coding Plan, business code 500).
+        assert!(is_plan_ended("当前用户不存在coding plan"));
+        assert!(is_plan_ended("User has no Coding Plan"));
+        // Auth rejections and generic errors must NOT read as plan-ended.
+        assert!(!is_plan_ended(
+            "Authorization Token非法，请确认Authorization Token正确传递。"
+        ));
+        assert!(!is_plan_ended("unknown error"));
+    }
+
+    #[test]
+    fn plan_ended_snapshot_shows_zero_remaining_and_survives_classification() {
+        let snap = plan_ended_snapshot("当前用户不存在coding plan".into());
+        let bar: Vec<&UsageWindow> = snap.windows.iter().filter(|w| w.bar_visible).collect();
+        assert_eq!(bar.len(), 2, "5h + weekly stay on the bar");
+        for w in bar {
+            assert_eq!(w.used_percent, 100.0, "{} must show 0% remaining", w.label);
+        }
+        assert_eq!(
+            snap.unavailable_reason.as_deref(),
+            Some("当前用户不存在coding plan"),
+            "stale badge tooltip keeps the upstream message"
+        );
+        // classify must keep the snapshot (transient-with-snapshot) so the bar
+        // actually updates to zero — a hard failure would freeze the last-good
+        // percentages instead.
+        let fetch = classify_snapshot(snap);
+        assert_eq!(fetch.health, crate::providers::ProviderHealth::TransientFailure);
+        assert!(fetch.snapshot.is_some());
+    }
 
     #[test]
     fn parse_dt_handles_ms_and_seconds() {
