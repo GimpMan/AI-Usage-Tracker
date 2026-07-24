@@ -12,6 +12,10 @@ use crate::secrets::Secrets;
 const ENDPOINT: &str = "https://api.z.ai/api/monitor/usage/quota/limit";
 const PROVIDER_LABEL: &str = "Z.ai Coding Plan";
 const KEY_ID: &str = "glm";
+/// Canonical English reason for an ended plan. The BFF's own message is
+/// localized to the account (observed: "当前用户不存在coding plan") and is
+/// only used for detection — the UI always shows this English text.
+const REASON_PLAN_ENDED: &str = "Z.ai Coding Plan ended — no active subscription";
 
 pub struct GlmProvider;
 
@@ -117,7 +121,7 @@ async fn fetch_quota(api_key: &str) -> UsageSnapshot {
         // no plan, so remaining quota really is zero. Show 0% left instead of
         // freezing the last-good percentages, which read as "quota remains".
         if is_plan_ended(&msg) {
-            return plan_ended_snapshot(msg);
+            return plan_ended_snapshot();
         }
         return UsageSnapshot::unavailable(PROVIDER_LABEL, msg);
     }
@@ -204,11 +208,11 @@ fn is_plan_ended(msg: &str) -> bool {
 }
 
 /// Zeroed-out windows for an ended plan: 0% remaining on the bar windows,
-/// with the upstream message kept as the unavailable reason so the stale
-/// badge tooltip explains why. Classifies as transient-with-snapshot, so the
-/// bar updates to zero immediately and recovers on its own if the user
-/// re-subscribes.
-fn plan_ended_snapshot(reason: String) -> UsageSnapshot {
+/// with the canonical English reason (`REASON_PLAN_ENDED`) so the stale
+/// badge tooltip and Settings row never show the localized BFF message.
+/// Classifies as transient-with-snapshot, so the bar updates to zero
+/// immediately and recovers on its own if the user re-subscribes.
+fn plan_ended_snapshot() -> UsageSnapshot {
     fn zeroed(label: &str) -> UsageWindow {
         UsageWindow {
             label: label.into(),
@@ -224,7 +228,7 @@ fn plan_ended_snapshot(reason: String) -> UsageSnapshot {
         provider: PROVIDER_LABEL.to_string(),
         level: None,
         windows: vec![zeroed("5h"), zeroed("weekly")],
-        unavailable_reason: Some(reason),
+        unavailable_reason: Some(REASON_PLAN_ENDED.into()),
         fetched_at: Utc::now(),
     }
 }
@@ -367,7 +371,7 @@ mod tests {
 
     #[test]
     fn plan_ended_snapshot_shows_zero_remaining_and_survives_classification() {
-        let snap = plan_ended_snapshot("当前用户不存在coding plan".into());
+        let snap = plan_ended_snapshot();
         let bar: Vec<&UsageWindow> = snap.windows.iter().filter(|w| w.bar_visible).collect();
         assert_eq!(bar.len(), 2, "5h + weekly stay on the bar");
         for w in bar {
@@ -375,8 +379,8 @@ mod tests {
         }
         assert_eq!(
             snap.unavailable_reason.as_deref(),
-            Some("当前用户不存在coding plan"),
-            "stale badge tooltip keeps the upstream message"
+            Some(REASON_PLAN_ENDED),
+            "UI surfaces the canonical English reason, not the localized BFF message"
         );
         // classify must keep the snapshot (transient-with-snapshot) so the bar
         // actually updates to zero — a hard failure would freeze the last-good
