@@ -954,8 +954,44 @@ pub async fn open_external(url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn poll_oauth_login(session_id: String) -> Result<crate::oauth::OAuthPoll, String> {
-    crate::oauth::poll_login(&session_id).await
+pub async fn poll_oauth_login(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::AppState>,
+    session_id: String,
+) -> Result<crate::oauth::OAuthPoll, String> {
+    let poll = crate::oauth::poll_login(&session_id).await?;
+    refresh_after_login(&app, &state, &poll).await;
+    Ok(poll)
+}
+
+/// A completed OAuth login may have just un-hidden a provider the scheduler
+/// auto-hid on MissingCredentials (see `oauth::unhide_after_login`). Such a
+/// provider has no in-memory snapshot, so fetch it immediately instead of
+/// leaving the Settings card on the stale pre-login state until the next
+/// scheduler tick. No-op when the provider already has data; a provider the
+/// user hid manually stays untouched (`do_refresh_provider` refuses hidden).
+async fn refresh_after_login(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, crate::AppState>,
+    poll: &crate::oauth::OAuthPoll,
+) {
+    if poll.status != "complete" {
+        return;
+    }
+    let Some(provider) = poll.provider.as_deref() else {
+        return;
+    };
+    let has_snap = {
+        let guard = state.snapshots.read().await;
+        guard.contains_key(provider)
+    };
+    if has_snap {
+        return;
+    }
+    if let Err(e) = do_refresh_provider(app, state, provider).await {
+        log::warn!("oauth login: post-login refresh failed for {provider}: {e}");
+    }
+    emit_provider_visibility_changed(app);
 }
 
 /// Restore an in-progress (or just-finished) OAuth session after Settings remounts.
@@ -973,10 +1009,14 @@ pub async fn list_active_oauth() -> Result<Vec<crate::oauth::OAuthStart>, String
 
 #[tauri::command]
 pub async fn complete_oauth_login(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::AppState>,
     session_id: String,
     code: String,
 ) -> Result<crate::oauth::OAuthPoll, String> {
-    crate::oauth::complete_login(&session_id, &code).await
+    let poll = crate::oauth::complete_login(&session_id, &code).await?;
+    refresh_after_login(&app, &state, &poll).await;
+    Ok(poll)
 }
 
 #[tauri::command]

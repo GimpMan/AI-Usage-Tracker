@@ -55,6 +55,22 @@ pub async fn start_login(provider: &str) -> Result<OAuthStart, String> {
     }
 }
 
+/// The scheduler auto-hides a provider on MissingCredentials. A freshly
+/// completed login must undo that — otherwise the provider stays hidden
+/// forever, is never polled again, and the bar keeps showing the stale
+/// pre-login state despite valid credentials. Called only on fresh
+/// transitions to Complete, so a provider the user hid *after* signing in
+/// stays hidden.
+fn unhide_after_login(provider: &str) {
+    if !crate::secrets::is_hidden(provider) {
+        return;
+    }
+    match crate::secrets::set_hidden(provider, false) {
+        Ok(()) => log::info!("oauth: login completed — un-hid provider {provider}"),
+        Err(e) => log::warn!("oauth: login completed but failed to un-hide {provider}: {e}"),
+    }
+}
+
 /// Snapshot of one active (or just-finished) session for UI restore.
 pub fn active_for_provider(provider: &str) -> Option<OAuthStart> {
     let store = sessions().lock().ok()?;
@@ -208,6 +224,7 @@ pub async fn poll_login(session_id: &str) -> Result<OAuthPoll, String> {
                         message: poll.message.clone().unwrap_or_else(|| "Signed in.".into()),
                     },
                 );
+                unhide_after_login(&session.provider);
             }
             "error" => {
                 set_phase(
@@ -249,12 +266,15 @@ pub async fn complete_login(session_id: &str, code: &str) -> Result<OAuthPoll, S
             let result = claude::complete(&session, code).await;
             if let Ok(ref poll) = result {
                 match poll.status.as_str() {
-                    "complete" => set_phase(
-                        &session.id,
-                        OAuthPhase::Complete {
-                            message: poll.message.clone().unwrap_or_else(|| "Signed in.".into()),
-                        },
-                    ),
+                    "complete" => {
+                        set_phase(
+                            &session.id,
+                            OAuthPhase::Complete {
+                                message: poll.message.clone().unwrap_or_else(|| "Signed in.".into()),
+                            },
+                        );
+                        unhide_after_login(&session.provider);
+                    }
                     "error" => set_phase(
                         &session.id,
                         OAuthPhase::Error {
