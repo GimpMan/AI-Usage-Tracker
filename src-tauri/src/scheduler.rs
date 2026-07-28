@@ -242,10 +242,17 @@ impl Scheduler {
                     let outcome = fetch_with_timeout(p.as_ref(), &self.secrets).await;
                     let health = outcome.health.clone();
                     let reason = outcome.reason.clone();
+                    let alerted = crate::alerts::load_alerted(&provider_id);
                     let events = {
                         let mut guard = snaps.write().await;
                         let mut health_guard = health_map.write().await;
-                        apply_fetch_outcome(&mut guard, &mut health_guard, &provider_id, outcome)
+                        apply_fetch_outcome(
+                            &mut guard,
+                            &mut health_guard,
+                            &provider_id,
+                            outcome,
+                            &alerted,
+                        )
                     };
                     let ok = matches!(health, ProviderHealth::Healthy);
                     let snap_clone = if ok {
@@ -307,15 +314,17 @@ impl Scheduler {
 ///
 /// Healthy snapshots go through last-good holding (impossible same-window
 /// drops are replaced by the previous value) before insertion. Returns the
-/// quota events detected between the previous and the incoming snapshot —
-/// window resets and edge-triggered threshold alerts — so callers can
-/// dispatch them after releasing the map locks. Non-healthy outcomes and
-/// first-ever fetches produce no events.
+/// quota events detected for the incoming snapshot — window resets and
+/// threshold alerts not yet covered by the `alerted` marker set — so
+/// callers can dispatch them after releasing the map locks. A first-ever
+/// fetch detects no resets but still alerts for windows already in an
+/// alert state; non-healthy outcomes produce no events.
 pub fn apply_fetch_outcome(
     snapshots: &mut HashMap<String, UsageSnapshot>,
     health: &mut HashMap<String, ProviderHealthState>,
     provider_id: &str,
     outcome: ProviderFetch,
+    alerted: &HashSet<String>,
 ) -> crate::alerts::QuotaEvents {
     match outcome.health {
         ProviderHealth::Healthy => {
@@ -323,7 +332,21 @@ pub fn apply_fetch_outcome(
             if let Some(mut snapshot) = outcome.snapshot {
                 if let Some(prev) = snapshots.get(provider_id) {
                     hold_last_good_used_percent(prev, &mut snapshot);
-                    events = crate::alerts::detect_quota_events(prev, &snapshot, provider_id);
+                    events =
+                        crate::alerts::detect_quota_events(prev, &snapshot, provider_id, alerted);
+                } else {
+                    // First-ever fetch: no previous snapshot to diff resets
+                    // against, but a window already below its red line or
+                    // exhausted still notifies once.
+                    let empty = UsageSnapshot {
+                        provider: snapshot.provider.clone(),
+                        level: None,
+                        windows: vec![],
+                        unavailable_reason: None,
+                        fetched_at: snapshot.fetched_at,
+                    };
+                    events =
+                        crate::alerts::detect_quota_events(&empty, &snapshot, provider_id, alerted);
                 }
                 snapshots.insert(provider_id.to_string(), snapshot);
             }
@@ -531,6 +554,7 @@ mod tests {
             &mut health,
             "glm",
             ProviderFetch::transient("network error"),
+            &HashSet::new(),
         );
         assert!(snapshots["glm"].unavailable_reason.is_none());
         apply_fetch_outcome(
@@ -538,6 +562,7 @@ mod tests {
             &mut health,
             "glm",
             ProviderFetch::transient("network error"),
+            &HashSet::new(),
         );
         assert!(snapshots["glm"].unavailable_reason.is_none());
         apply_fetch_outcome(
@@ -545,6 +570,7 @@ mod tests {
             &mut health,
             "glm",
             ProviderFetch::transient("network error"),
+            &HashSet::new(),
         );
         assert_eq!(
             snapshots["glm"].unavailable_reason.as_deref(),
@@ -578,6 +604,7 @@ mod tests {
             &mut health,
             "minimax",
             ProviderFetch::hard(ProviderHealth::InvalidCredentials, "invalid api key"),
+            &HashSet::new(),
         );
 
         let kept = &snapshots["minimax"];
@@ -605,6 +632,7 @@ mod tests {
                 ProviderHealth::NoUsableDetails,
                 "endpoint returned no percentage fields",
             ),
+            &HashSet::new(),
         );
 
         let kept = &snapshots["minimax"];
@@ -628,6 +656,7 @@ mod tests {
             &mut health,
             "minimax",
             ProviderFetch::hard(ProviderHealth::InvalidCredentials, "invalid api key"),
+            &HashSet::new(),
         );
 
         assert!(!snapshots.contains_key("minimax"));
@@ -744,6 +773,7 @@ mod tests {
             &mut health,
             "codex",
             ProviderFetch::healthy(snap("Codex", vec![win("wk", 1.0, Some(rst))])),
+            &HashSet::new(),
         );
         assert!((snapshots["codex"].windows[0].used_percent - 24.0).abs() < 0.001);
     }
@@ -768,15 +798,18 @@ mod tests {
                 "GLM",
                 vec![win("weekly", 5.0, Some(now + chrono::Duration::days(7)))],
             )),
+            &HashSet::new(),
         );
         assert_eq!(events.resets, vec!["weekly".to_string()]);
 
-        // First-ever fetch: no previous snapshot, no events.
+        // First-ever fetch: no previous snapshot, no resets — and this
+        // window is nowhere near an alert state, so no alerts either.
         let events = apply_fetch_outcome(
             &mut snapshots,
             &mut health,
             "codex",
             ProviderFetch::healthy(snap("Codex", vec![win("weekly", 5.0, None)])),
+            &HashSet::new(),
         );
         assert!(events.resets.is_empty());
         assert!(events.alerts.is_empty());
@@ -787,8 +820,40 @@ mod tests {
             &mut health,
             "glm",
             ProviderFetch::transient("network error"),
+            &HashSet::new(),
         );
         assert!(events.resets.is_empty());
+        assert!(events.alerts.is_empty());
+    }
+
+    #[test]
+    fn first_ever_fetch_alerts_for_already_exhausted_window() {
+        // No previous snapshot (fresh install): a quota already at 0% left
+        // must still produce its one-shot alert.
+        let mut snapshots = HashMap::new();
+        let mut health = HashMap::new();
+        let events = apply_fetch_outcome(
+            &mut snapshots,
+            &mut health,
+            "glm",
+            ProviderFetch::healthy(snap("GLM", vec![win("weekly", 100.0, None)])),
+            &HashSet::new(),
+        );
+        assert_eq!(
+            events.alerts,
+            vec![crate::alerts::QuotaAlert::Exhausted {
+                label: "weekly".into()
+            }]
+        );
+        // …unless its marker was already persisted.
+        let alerted: HashSet<String> = events.alert_keys.iter().cloned().collect();
+        let events = apply_fetch_outcome(
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            "glm",
+            ProviderFetch::healthy(snap("GLM", vec![win("weekly", 100.0, None)])),
+            &alerted,
+        );
         assert!(events.alerts.is_empty());
     }
 }

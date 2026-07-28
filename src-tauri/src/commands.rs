@@ -477,6 +477,7 @@ async fn do_refresh(app: &tauri::AppHandle, state: &crate::AppState) {
             crate::scheduler::with_provider_fetch_lock(&provider_id, Some(app), async {
                 let outcome = crate::scheduler::fetch_with_timeout(p.as_ref(), &secrets).await;
                 let health = outcome.health.clone();
+                let alerted = crate::alerts::load_alerted(&provider_id);
                 let (events, snap_clone) = {
                     let mut guard = snaps.write().await;
                     let mut health_guard = health_map.write().await;
@@ -485,6 +486,7 @@ async fn do_refresh(app: &tauri::AppHandle, state: &crate::AppState) {
                         &mut health_guard,
                         &provider_id,
                         outcome,
+                        &alerted,
                     );
                     let snap_clone = if matches!(health, ProviderHealth::Healthy) {
                         guard.get(&provider_id).cloned()
@@ -571,6 +573,7 @@ async fn do_refresh_provider(
                 crate::scheduler::fetch_with_timeout(provider.as_ref(), &secrets).await;
             let health = outcome.health.clone();
             let reason = outcome.reason.clone();
+            let alerted = crate::alerts::load_alerted(provider_id);
             let events = {
                 let mut guard = snaps.write().await;
                 let mut health_guard = health_map.write().await;
@@ -579,6 +582,7 @@ async fn do_refresh_provider(
                     &mut health_guard,
                     provider_id,
                     outcome,
+                    &alerted,
                 )
             };
             let ok = matches!(health, ProviderHealth::Healthy);

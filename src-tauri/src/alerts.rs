@@ -1,9 +1,14 @@
 //! Quota-event detection between consecutive snapshots of one provider:
-//! rate-limit window resets and edge-triggered threshold crossings (below the
-//! even-pace red line, or exhausted). Detection is pure; dispatching emits the
-//! frontend `quota-window-reset` event and fires OS notifications.
+//! rate-limit window resets and threshold alerts (below the even-pace red
+//! line, or exhausted). Detection is pure; dispatching emits the frontend
+//! `quota-window-reset` event, fires OS notifications, and reconciles the
+//! persisted alert markers (`alert-state.json`) so each window period
+//! notifies exactly once — even when the crossing happened while the app
+//! was closed or before tracking started.
 
 use chrono::{DateTime, Utc};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use tauri::Emitter;
 use tauri_plugin_notification::NotificationExt;
 
@@ -11,14 +16,18 @@ use crate::providers::{short_provider_name, UsageSnapshot, UsageWindow};
 use crate::scheduler::USED_PERCENT_DROP_TOLERANCE;
 
 /// Events detected between the previous and the incoming snapshot of one
-/// provider. Both lists are empty for first-ever fetches and non-healthy
-/// outcomes.
+/// provider. All lists are empty for non-healthy outcomes.
 #[derive(Clone, Debug, Default)]
 pub struct QuotaEvents {
     /// Labels of windows that reset: `reset_at` advanced and usage dropped.
     pub resets: Vec<String>,
-    /// Edge-triggered threshold crossings.
+    /// Threshold alerts to notify: windows in an alert state whose marker
+    /// key was not yet persisted.
     pub alerts: Vec<QuotaAlert>,
+    /// Marker keys of every window currently in an alert state, whether or
+    /// not it produced a notification. Dispatch reconciles the persisted
+    /// marker set against this list.
+    pub alert_keys: Vec<String>,
 }
 
 /// A threshold crossing on one rate-limit window.
@@ -79,53 +88,74 @@ fn below_red_line(window: &UsageWindow, fetched_at: DateTime<Utc>) -> Option<boo
     Some(remaining < sub_target)
 }
 
+/// Marker key identifying one alertable window period: the label plus the
+/// current `reset_at`, so a window reset naturally re-arms its alerts.
+fn alert_key(window: &UsageWindow) -> String {
+    let reset = window
+        .reset_at
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_else(|| "none".into());
+    format!("{}|{reset}", window.label)
+}
+
 /// Diff two consecutive snapshots of one provider. `incoming` must be the
 /// post-hold-last-good value so held readings don't raise phantom events.
+///
+/// Alerts are state-based, not edge-triggered: any bar window currently
+/// below its red pace line or exhausted produces an alert unless its marker
+/// key is in `alerted` (already notified for this window period). This
+/// catches crossings missed while the app was closed and windows already
+/// red when tracking started. Exhaustion applies to every bar window —
+/// including monthly and reset-at-less windows, which carry no pace
+/// target — while the red-line check stays limited to weekly/5h windows
+/// with a `reset_at`. OpenRouter is exempt, mirroring the under-red-line
+/// guard in src/bar-summary.ts.
 pub fn detect_quota_events(
     prev: &UsageSnapshot,
     incoming: &UsageSnapshot,
     provider_id: &str,
+    alerted: &HashSet<String>,
 ) -> QuotaEvents {
     let mut events = QuotaEvents::default();
     for window in &incoming.windows {
-        let Some(prev_window) = prev.windows.iter().find(|w| w.label == window.label) else {
-            continue;
-        };
         // Window reset: same label, advanced `reset_at`, and a usage drop
         // beyond the same tolerance `hold_last_good_used_percent` applies.
-        if let (Some(prev_reset), Some(next_reset)) = (prev_window.reset_at, window.reset_at) {
-            if prev_reset != next_reset
-                && window.used_percent + USED_PERCENT_DROP_TOLERANCE < prev_window.used_percent
-            {
-                events.resets.push(window.label.clone());
+        if let Some(prev_window) = prev.windows.iter().find(|w| w.label == window.label) {
+            if let (Some(prev_reset), Some(next_reset)) = (prev_window.reset_at, window.reset_at) {
+                if prev_reset != next_reset
+                    && window.used_percent + USED_PERCENT_DROP_TOLERANCE < prev_window.used_percent
+                {
+                    events.resets.push(window.label.clone());
+                }
             }
         }
-        // Threshold alerts are limited to paced bar windows; OpenRouter is
-        // exempt, mirroring the under-red-line guard in src/bar-summary.ts.
-        if provider_id == "openrouter"
-            || !window.bar_visible
-            || window.is_unlimited
-            || window.reset_at.is_none()
-            || !(is_weekly_label(&window.label) || is_five_hour_label(&window.label))
-        {
+        // OpenRouter never alerts (mirrors the src/bar-summary.ts guard);
+        // popup-only and unlimited windows stay silent.
+        if provider_id == "openrouter" || !window.bar_visible || window.is_unlimited {
             continue;
         }
-        let prev_remaining = (100.0 - prev_window.used_percent).clamp(0.0, 100.0);
         let next_remaining = (100.0 - window.used_percent).clamp(0.0, 100.0);
-        if next_remaining <= 0.0 {
-            if prev_remaining > 0.0 {
-                events.alerts.push(QuotaAlert::Exhausted {
-                    label: window.label.clone(),
-                });
-            }
-            continue;
-        }
-        let next_below = below_red_line(window, incoming.fetched_at).unwrap_or(false);
-        let prev_below = below_red_line(prev_window, prev.fetched_at).unwrap_or(false);
-        if next_below && !prev_below {
-            events.alerts.push(QuotaAlert::BelowRedLine {
+        let alert = if next_remaining <= 0.0 {
+            // Exhaustion needs no pace target and no `reset_at`.
+            Some(QuotaAlert::Exhausted {
                 label: window.label.clone(),
-            });
+            })
+        } else if window.reset_at.is_some()
+            && (is_weekly_label(&window.label) || is_five_hour_label(&window.label))
+            && below_red_line(window, incoming.fetched_at).unwrap_or(false)
+        {
+            Some(QuotaAlert::BelowRedLine {
+                label: window.label.clone(),
+            })
+        } else {
+            None
+        };
+        if let Some(alert) = alert {
+            let key = alert_key(window);
+            events.alert_keys.push(key.clone());
+            if !alerted.contains(&key) {
+                events.alerts.push(alert);
+            }
         }
     }
     events
@@ -143,9 +173,59 @@ pub fn notification_body(provider_id: &str, alert: &QuotaAlert) -> String {
     }
 }
 
-/// Emit `quota-window-reset` (fixed frontend contract) and fire one OS
-/// notification per alert when notifications are enabled. Call after the
-/// snapshot locks are released.
+/// Path of the alert-marker store, next to `config.json` / `state.json`.
+fn alerts_state_path() -> Option<PathBuf> {
+    crate::secrets::config_dir()
+        .ok()
+        .map(|d| d.join("alert-state.json"))
+}
+
+/// Load the marker keys already notified for `provider_id`.
+pub fn load_alerted(provider_id: &str) -> HashSet<String> {
+    let Some(path) = alerts_state_path() else {
+        return HashSet::new();
+    };
+    load_alerted_from(&path, provider_id)
+}
+
+fn load_alerted_from(path: &Path, provider_id: &str) -> HashSet<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<HashMap<String, HashSet<String>>>(&text).ok())
+        .and_then(|mut map| map.remove(provider_id))
+        .unwrap_or_default()
+}
+
+/// Replace the persisted marker set for `provider_id`. An empty set removes
+/// the provider entry, so recovered windows re-arm their alerts.
+pub fn save_alerted(provider_id: &str, keys: &HashSet<String>) {
+    let Some(path) = alerts_state_path() else {
+        return;
+    };
+    save_alerted_to(&path, provider_id, keys);
+}
+
+fn save_alerted_to(path: &Path, provider_id: &str, keys: &HashSet<String>) {
+    let mut map: HashMap<String, HashSet<String>> = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    if keys.is_empty() {
+        map.remove(provider_id);
+    } else {
+        map.insert(provider_id.to_string(), keys.clone());
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&map) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+/// Emit `quota-window-reset` (fixed frontend contract), fire one OS
+/// notification per alert when notifications are enabled, and reconcile the
+/// persisted alert markers against the windows currently in an alert state.
+/// When notifications are disabled no new markers are written, so enabling
+/// the toggle later still notifies for windows that are red at that moment.
+/// Call after the snapshot locks are released.
 pub fn dispatch_quota_events(app: &tauri::AppHandle, provider_id: &str, events: &QuotaEvents) {
     if !events.resets.is_empty() {
         let _ = app.emit(
@@ -153,16 +233,25 @@ pub fn dispatch_quota_events(app: &tauri::AppHandle, provider_id: &str, events: 
             &serde_json::json!({ "provider": provider_id, "windows": events.resets }),
         );
     }
-    if events.alerts.is_empty() || !crate::secrets::get_notifications_enabled() {
-        return;
-    }
-    for alert in &events.alerts {
-        let _ = app
-            .notification()
-            .builder()
-            .title("AI Usage Tracker")
-            .body(notification_body(provider_id, alert))
-            .show();
+    let current: HashSet<String> = events.alert_keys.iter().cloned().collect();
+    if !events.alerts.is_empty() && crate::secrets::get_notifications_enabled() {
+        for alert in &events.alerts {
+            let _ = app
+                .notification()
+                .builder()
+                .title("AI Usage Tracker")
+                .body(notification_body(provider_id, alert))
+                .show();
+        }
+        save_alerted(provider_id, &current);
+    } else {
+        // Keep markers only for windows still in an alert state; a window
+        // that recovered (or reset) re-arms its alerts.
+        let kept: HashSet<String> = load_alerted(provider_id)
+            .into_iter()
+            .filter(|k| current.contains(k))
+            .collect();
+        save_alerted(provider_id, &kept);
     }
 }
 
@@ -193,6 +282,10 @@ mod tests {
         }
     }
 
+    fn no_alerts() -> HashSet<String> {
+        HashSet::new()
+    }
+
     #[test]
     fn reset_detected_on_reset_at_change_with_usage_drop() {
         let now = Utc::now();
@@ -201,7 +294,7 @@ mod tests {
             vec![win("weekly", 5.0, Some(now + Duration::days(7)))],
             now + Duration::minutes(1),
         );
-        let events = detect_quota_events(&prev, &incoming, "glm");
+        let events = detect_quota_events(&prev, &incoming, "glm", &no_alerts());
         assert_eq!(events.resets, vec!["weekly".to_string()]);
         assert!(events.alerts.is_empty());
     }
@@ -216,17 +309,25 @@ mod tests {
             vec![win("weekly", 5.0, Some(reset))],
             now + Duration::minutes(1),
         );
-        assert!(detect_quota_events(&prev, &incoming, "glm").resets.is_empty());
+        assert!(
+            detect_quota_events(&prev, &incoming, "glm", &no_alerts())
+                .resets
+                .is_empty()
+        );
         // New reset_at but drop within the 1.0 tolerance: not a reset.
         let incoming = snap_at(
             vec![win("weekly", 79.5, Some(now + Duration::days(7)))],
             now + Duration::minutes(1),
         );
-        assert!(detect_quota_events(&prev, &incoming, "glm").resets.is_empty());
+        assert!(
+            detect_quota_events(&prev, &incoming, "glm", &no_alerts())
+                .resets
+                .is_empty()
+        );
     }
 
     #[test]
-    fn below_red_line_fires_only_on_the_crossing_edge() {
+    fn below_red_line_fires_on_crossing_and_when_already_below() {
         let now = Utc::now();
         let reset = now + Duration::days(3);
         // Above the red line: 40% left with 3 days to go (below needs < ~32%).
@@ -236,28 +337,36 @@ mod tests {
             vec![win("weekly", 80.0, Some(reset))],
             now + Duration::minutes(1),
         );
-        let events = detect_quota_events(&prev_above, &incoming_below, "glm");
+        let events = detect_quota_events(&prev_above, &incoming_below, "glm", &no_alerts());
         assert_eq!(
             events.alerts,
             vec![QuotaAlert::BelowRedLine {
                 label: "weekly".into()
             }]
         );
-        // Already below on both sides: no edge, no alert.
+        assert_eq!(events.alert_keys.len(), 1);
+        // Already below on both sides still fires when never notified — the
+        // crossing may have happened while the app was closed.
         let prev_below = snap_at(vec![win("weekly", 70.0, Some(reset))], now);
-        let events = detect_quota_events(&prev_below, &incoming_below, "glm");
+        let events = detect_quota_events(&prev_below, &incoming_below, "glm", &no_alerts());
+        assert_eq!(events.alerts.len(), 1);
+        // …but not when its marker was already persisted.
+        let alerted: HashSet<String> = events.alert_keys.iter().cloned().collect();
+        let events = detect_quota_events(&prev_below, &incoming_below, "glm", &alerted);
         assert!(events.alerts.is_empty());
-        // Staying above: no alert either.
+        assert_eq!(events.alert_keys.len(), 1);
+        // Staying above: no alert, no marker.
         let incoming_above = snap_at(
             vec![win("weekly", 65.0, Some(reset))],
             now + Duration::minutes(1),
         );
-        let events = detect_quota_events(&prev_above, &incoming_above, "glm");
+        let events = detect_quota_events(&prev_above, &incoming_above, "glm", &no_alerts());
         assert!(events.alerts.is_empty());
+        assert!(events.alert_keys.is_empty());
     }
 
     #[test]
-    fn exhausted_fires_on_the_zero_remaining_edge_only() {
+    fn exhausted_fires_until_marked() {
         let now = Utc::now();
         let reset = now + Duration::days(3);
         let prev = snap_at(vec![win("weekly", 80.0, Some(reset))], now);
@@ -265,16 +374,56 @@ mod tests {
             vec![win("weekly", 100.0, Some(reset))],
             now + Duration::minutes(1),
         );
-        let events = detect_quota_events(&prev, &exhausted, "codex");
+        let events = detect_quota_events(&prev, &exhausted, "codex", &no_alerts());
         assert_eq!(
             events.alerts,
             vec![QuotaAlert::Exhausted {
                 label: "weekly".into()
             }]
         );
-        // Already exhausted: no re-fire.
-        let events = detect_quota_events(&exhausted, &exhausted, "codex");
+        // Already exhausted on both sides: fires once when never notified,
+        // then stays silent once the marker exists.
+        let events = detect_quota_events(&exhausted, &exhausted, "codex", &no_alerts());
+        assert_eq!(events.alerts.len(), 1);
+        let alerted: HashSet<String> = events.alert_keys.iter().cloned().collect();
+        let events = detect_quota_events(&exhausted, &exhausted, "codex", &alerted);
         assert!(events.alerts.is_empty());
+    }
+
+    #[test]
+    fn exhausted_fires_without_reset_at_and_for_monthly_labels() {
+        let now = Utc::now();
+        // GLM-style windows carry no reset_at; running out must still alert.
+        let prev = snap_at(vec![win("weekly", 80.0, None)], now);
+        let exhausted = snap_at(vec![win("weekly", 100.0, None)], now + Duration::minutes(1));
+        let events = detect_quota_events(&prev, &exhausted, "glm", &no_alerts());
+        assert_eq!(
+            events.alerts,
+            vec![QuotaAlert::Exhausted {
+                label: "weekly".into()
+            }]
+        );
+        // Monthly windows have no pace target, but hitting 0% left alerts.
+        let prev = snap_at(vec![win("monthly", 74.0, Some(now + Duration::days(4)))], now);
+        let exhausted = snap_at(
+            vec![win("monthly", 100.0, Some(now + Duration::days(4)))],
+            now + Duration::minutes(1),
+        );
+        let events = detect_quota_events(&prev, &exhausted, "grok", &no_alerts());
+        assert_eq!(
+            events.alerts,
+            vec![QuotaAlert::Exhausted {
+                label: "monthly".into()
+            }]
+        );
+        // Monthly windows never get a red-line alert (no pace math for them).
+        let below = snap_at(
+            vec![win("monthly", 95.0, Some(now + Duration::days(1)))],
+            now + Duration::minutes(1),
+        );
+        let events = detect_quota_events(&prev, &below, "grok", &no_alerts());
+        assert!(events.alerts.is_empty());
+        assert!(events.alert_keys.is_empty());
     }
 
     #[test]
@@ -288,7 +437,7 @@ mod tests {
             vec![win("5h", 90.0, Some(reset))],
             now + Duration::minutes(1),
         );
-        let events = detect_quota_events(&prev, &incoming, "minimax");
+        let events = detect_quota_events(&prev, &incoming, "minimax", &no_alerts());
         assert_eq!(
             events.alerts,
             vec![QuotaAlert::BelowRedLine {
@@ -298,11 +447,11 @@ mod tests {
     }
 
     #[test]
-    fn skips_openrouter_unlimited_missing_reset_and_unclassified_labels() {
+    fn skips_openrouter_unlimited_and_hidden_windows() {
         let now = Utc::now();
         let reset = now + Duration::days(3);
-        // Each pair crosses to 0% remaining, which would fire Exhausted if
-        // the window were eligible.
+        // Each pair sits at 0% remaining, which would fire Exhausted if the
+        // window were eligible.
         let mk = |window: UsageWindow| {
             (
                 snap_at(
@@ -323,9 +472,11 @@ mod tests {
         };
         // OpenRouter never alerts (mirrors the src/bar-summary.ts guard).
         let (prev, incoming) = mk(win("weekly", 0.0, Some(reset)));
-        assert!(detect_quota_events(&prev, &incoming, "openrouter")
-            .alerts
-            .is_empty());
+        assert!(
+            detect_quota_events(&prev, &incoming, "openrouter", &no_alerts())
+                .alerts
+                .is_empty()
+        );
         // Unlimited windows never alert.
         let unlimited = UsageWindow {
             is_unlimited: true,
@@ -334,22 +485,34 @@ mod tests {
             ..win("weekly", 0.0, Some(reset))
         };
         let (prev, incoming) = mk(unlimited);
-        assert!(detect_quota_events(&prev, &incoming, "glm").alerts.is_empty());
-        // No reset_at: no pace target, no alert.
-        let (prev, incoming) = mk(win("weekly", 0.0, None));
-        assert!(detect_quota_events(&prev, &incoming, "glm").alerts.is_empty());
-        // daily / monthly labels don't classify as weekly/5h.
-        let (prev, incoming) = mk(win("daily", 0.0, Some(reset)));
-        assert!(detect_quota_events(&prev, &incoming, "glm").alerts.is_empty());
-        let (prev, incoming) = mk(win("monthly", 0.0, Some(reset)));
-        assert!(detect_quota_events(&prev, &incoming, "glm").alerts.is_empty());
+        assert!(
+            detect_quota_events(&prev, &incoming, "glm", &no_alerts())
+                .alerts
+                .is_empty()
+        );
         // Popup-only windows (bar_visible = false) stay silent.
         let hidden = UsageWindow {
             bar_visible: false,
             ..win("weekly", 0.0, Some(reset))
         };
         let (prev, incoming) = mk(hidden);
-        assert!(detect_quota_events(&prev, &incoming, "glm").alerts.is_empty());
+        assert!(
+            detect_quota_events(&prev, &incoming, "glm", &no_alerts())
+                .alerts
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn no_reset_at_means_no_red_line_alert() {
+        let now = Utc::now();
+        // No reset_at: no pace target, so BelowRedLine can never fire — but
+        // the window stays eligible for Exhausted (covered above).
+        let prev = snap_at(vec![win("weekly", 80.0, None)], now);
+        let incoming = snap_at(vec![win("weekly", 95.0, None)], now + Duration::minutes(1));
+        let events = detect_quota_events(&prev, &incoming, "glm", &no_alerts());
+        assert!(events.alerts.is_empty());
+        assert!(events.alert_keys.is_empty());
     }
 
     #[test]
@@ -386,5 +549,36 @@ mod tests {
             ),
             "Codex 5h quota exhausted"
         );
+    }
+
+    #[test]
+    fn alert_state_roundtrips_and_clears_per_provider() {
+        let dir = std::env::temp_dir().join(format!("ai-usage-alerts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("alert-state.json");
+
+        // Missing file → empty set.
+        assert!(load_alerted_from(&path, "glm").is_empty());
+
+        let keys: HashSet<String> = ["weekly|none".to_string()].into_iter().collect();
+        save_alerted_to(&path, "glm", &keys);
+        assert_eq!(load_alerted_from(&path, "glm"), keys);
+        // Other providers are untouched.
+        assert!(load_alerted_from(&path, "codex").is_empty());
+
+        // Saving for one provider preserves another's markers.
+        let other: HashSet<String> = ["wk|2026-08-04T05:54:18+00:00".to_string()]
+            .into_iter()
+            .collect();
+        save_alerted_to(&path, "codex", &other);
+        assert_eq!(load_alerted_from(&path, "glm"), keys);
+        assert_eq!(load_alerted_from(&path, "codex"), other);
+
+        // Empty set removes the provider entry.
+        save_alerted_to(&path, "glm", &HashSet::new());
+        assert!(load_alerted_from(&path, "glm").is_empty());
+        assert_eq!(load_alerted_from(&path, "codex"), other);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
