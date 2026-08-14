@@ -53,6 +53,16 @@ export function isFiveHourWindow(label: string): boolean {
   return normalized === "5h" || normalized.startsWith("5h ·");
 }
 
+/** Parse a "<N>h" rolling-window label (e.g. Codex Free's "720h" 30-day
+ *  quota) into hours. Sub-day windows return null: "5h" has its own pace
+ *  path and anything shorter is too volatile for a pace line. */
+export function rollingWindowHours(label: string): number | null {
+  const match = /^(\d+)h$/.exec(label.trim().toLowerCase());
+  if (!match) return null;
+  const hours = Number(match[1]);
+  return hours >= 24 ? hours : null;
+}
+
 function clampPercent(value: number): number {
   return Math.min(100, Math.max(0, value));
 }
@@ -390,13 +400,66 @@ export function fiveHourEvenPace(
 }
 
 // ============================================================
-// Daily/monthly calendar pace + the shared resolver.
-// OpenRouter's weekly window is caught by isWeeklyWindow above; this
-// handles daily (24h) and monthly (~days-in-month) windows.
-// Daily/monthly are provider-gated via resolveEvenPace (see
+// Long rolling windows ("<N>h", N ≥ 24) + daily/monthly calendar pace + the
+// shared resolver. OpenRouter's weekly window is caught by isWeeklyWindow
+// above; calendar pace handles daily (24h) and monthly (~days-in-month)
+// windows. Daily/monthly are provider-gated via resolveEvenPace (see
 // CALENDAR_PACE_PROVIDERS) so that, e.g., Z.ai's monthly tool-use quota
 // is not given a pace line.
 // ============================================================
+
+/** Normalize a long rolling window ("<N>h", e.g. Codex Free's 720h 30-day
+ *  quota) into the shared EvenPace shape. The period is the window's own
+ *  duration (rolling, not calendar); the sub-target steps daily like the
+ *  weekly/monthly paths. No `recentRatePercentPerMs` — the burn history
+ *  only covers weekly/5h windows, so the projection uses the period
+ *  average. */
+export function rollingHoursEvenPace(
+  window: UsageWindow,
+  nowMs = Date.now(),
+): EvenPace | null {
+  const hours = rollingWindowHours(window.label);
+  if (hours == null || !Number.isFinite(window.used_percent)) return null;
+  if (!window.reset_at) return null;
+  const resetMs = Date.parse(window.reset_at);
+  if (!Number.isFinite(resetMs) || resetMs <= nowMs) return null;
+
+  const periodMs = hours * HOUR_MS;
+  const periodDays = hours / 24;
+  const timeLeftMs = resetMs - nowMs;
+  const daysLeft = timeLeftMs / DAY_MS;
+  const remainingPercent = clampPercent(100 - window.used_percent);
+  const dailyQuotaPercent = remainingPercent / daysLeft;
+  const targetRemainingPercent = clampPercent((timeLeftMs / periodMs) * 100);
+  return {
+    remainingPercent,
+    targetRemainingPercent,
+    subTargetRemainingPercent: clampPercent(
+      targetRemainingPercent - dailyQuotaPercent,
+    ),
+    tickPercentages: [1, 2, 3, 4, 5].map((n) => (n / 6) * 100),
+    gradientPercent: paceGradientPercent(
+      remainingPercent,
+      targetRemainingPercent,
+      100 / periodDays, // one day (gradient scaling)
+    ),
+    note: `~${(remainingPercent / Math.max(daysLeft, 1)).toFixed(1)}%/day available until reset`,
+    gapNote: formatPaceGapNote(targetRemainingPercent, remainingPercent),
+    timeNote: formatPaceTimeNote(
+      remainingPercent,
+      targetRemainingPercent,
+      periodMs,
+    ),
+    projectionNote: formatProjectionNote(
+      remainingPercent,
+      window.used_percent,
+      timeLeftMs,
+      periodMs,
+    ),
+    targetLabel: `${periodDays}-day`,
+    subTargetKind: "daily",
+  };
+}
 
 const OPENROUTER_DAILY_TICK_HOURS = [4, 8, 12, 16, 20];
 
@@ -520,11 +583,12 @@ export function dollarMonthlyProjectionNote(
 const CALENDAR_PACE_PROVIDERS = ["openrouter", "grok"];
 
 /** Resolve any window to its EvenPace, or null when no pace applies.
- *  5h and weekly are label-driven (any provider); daily/monthly are gated
- *  to CALENDAR_PACE_PROVIDERS via the provider label.
+ *  5h, weekly, and long rolling "<N>h" windows (e.g. Codex Free's 720h)
+ *  are label-driven (any provider); daily/monthly are gated to
+ *  CALENDAR_PACE_PROVIDERS via the provider label.
  *  `recentRatePercentPerMs` (from `recentProjectionRate`) is forwarded to the
- *  weekly/5h projection; calendar-paced windows never get it (the burn
- *  history only covers weekly/5h windows). */
+ *  weekly/5h projection; rolling-hours and calendar-paced windows never get
+ *  it (the burn history only covers weekly/5h windows). */
 export function resolveEvenPace(
   window: UsageWindow,
   providerLabel: string,
@@ -535,6 +599,8 @@ export function resolveEvenPace(
     return fiveHourEvenPace(window, nowMs, recentRatePercentPerMs);
   if (isWeeklyWindow(window.label))
     return weeklyEvenPace(window, nowMs, recentRatePercentPerMs);
+  if (rollingWindowHours(window.label) != null)
+    return rollingHoursEvenPace(window, nowMs);
   const provider = providerLabel.toLowerCase();
   if (CALENDAR_PACE_PROVIDERS.some((p) => provider.includes(p))) {
     return openrouterEvenPace(window, nowMs);

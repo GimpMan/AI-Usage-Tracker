@@ -482,6 +482,12 @@ fn window_label(kind: &str, minutes: Option<i64>) -> String {
     if minutes == Some(60 * 24 * 7) {
         return "wk".into();
     }
+    // Codex Free's 30-day quota can likewise sit in either slot; normalize
+    // both to "720h" so the rolling-hours pace logic (weekly-pace.ts /
+    // alerts.rs) applies regardless of position.
+    if minutes == Some(60 * 24 * 30) {
+        return "720h".into();
+    }
 
     match (kind, minutes) {
         ("primary", Some(m)) if m % 60 == 0 => format!("{}h", m / 60),
@@ -798,6 +804,9 @@ mod tests {
         assert_eq!(window_label("primary", Some(45)), "45m");
         assert_eq!(window_label("secondary", Some(60 * 24)), "1d");
         assert_eq!(window_label("secondary", Some(60 * 24 * 7)), "wk");
+        // Codex Free's 30-day quota normalizes to "720h" in either slot.
+        assert_eq!(window_label("primary", Some(60 * 24 * 30)), "720h");
+        assert_eq!(window_label("secondary", Some(60 * 24 * 30)), "720h");
     }
 
     #[test]

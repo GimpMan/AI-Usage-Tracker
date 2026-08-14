@@ -14,6 +14,9 @@ import {
   isFiveHourWindow,
   isWeeklyWindow,
   recentProjectionRate,
+  resolveEvenPace,
+  rollingHoursEvenPace,
+  rollingWindowHours,
   weeklyEvenPace,
   RECENT_BURN_WINDOW_WEEKLY_MS,
   WEEK_DAYS,
@@ -622,3 +625,58 @@ assert.equal(
 );
 
 console.log("weekly pace tests passed");
+
+// ============================================================
+// Rolling "<N>h" windows (Codex Free's 720h = 30-day quota).
+// ============================================================
+assert.equal(rollingWindowHours("720h"), 720);
+assert.equal(rollingWindowHours("24h"), 24);
+// Sub-day windows and non-numeric labels get no rolling pace.
+assert.equal(rollingWindowHours("5h"), null);
+assert.equal(rollingWindowHours("1h"), null);
+assert.equal(rollingWindowHours("weekly"), null);
+assert.equal(rollingWindowHours("45m"), null);
+
+// 28 days left of a 30-day window → even-pace target ~93.33% remaining.
+const rolling = resolveEvenPace(
+  { label: "720h", used_percent: 13, reset_at: resetAfter(28), bar_visible: true },
+  "Codex",
+  now,
+);
+assert.ok(rolling, "720h window should produce pace for any provider");
+closeTo(rolling.remainingPercent, 87);
+closeTo(rolling.targetRemainingPercent, (28 / 30) * 100);
+// Sub-target = blue target minus one day of the available %/day (87 / 28).
+closeTo(rolling.subTargetRemainingPercent, (28 / 30) * 100 - 87 / 28);
+assert.equal(rolling.tickPercentages.length, 5);
+assert.equal(rolling.targetLabel, "30-day");
+assert.equal(rolling.subTargetKind, "daily");
+assert.equal(rolling.note, "~3.1%/day available until reset");
+// 87% vs ~93.3% target → 6.3% over even pace.
+assert.equal(rolling.gapNote, "6.3% over even pace");
+// 13% used in the first 2 days → burns 195% total → runs out ~13.4 days early.
+assert.ok(
+  rolling.projectionNote.startsWith("Projection: runs out in"),
+  `unexpected projection: ${rolling.projectionNote}`,
+);
+
+// Sub-day labels keep returning null from the shared resolver.
+assert.equal(
+  resolveEvenPace(
+    { label: "1h", used_percent: 50, reset_at: resetAfter(0.5), bar_visible: true },
+    "Codex",
+    now,
+  ),
+  null,
+  "a 1h window gets no pace line",
+);
+// No reset_at → no pace (cannot compute a target).
+assert.equal(
+  rollingHoursEvenPace(
+    { label: "720h", used_percent: 50, reset_at: null, bar_visible: true },
+    now,
+  ),
+  null,
+);
+
+console.log("rolling hours pace tests passed");

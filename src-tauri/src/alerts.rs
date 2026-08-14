@@ -60,11 +60,20 @@ pub(crate) fn is_five_hour_label(label: &str) -> bool {
     normalized == "5h" || normalized.starts_with("5h ·")
 }
 
+/// Port of `rollingWindowHours` (src/weekly-pace.ts): "<N>h" rolling-window
+/// labels with N ≥ 24 (e.g. Codex Free's "720h" 30-day quota). Sub-day
+/// windows return None — "5h" has its own path and anything shorter gets
+/// no pace line.
+pub(crate) fn rolling_hours_label(label: &str) -> Option<f64> {
+    let hours: f64 = label.trim().trim_end_matches('h').trim().parse().ok()?;
+    (hours >= 24.0).then_some(hours)
+}
+
 /// Whether the window is under its even-pace red line at `fetched_at` — the
 /// same math the frontend applies in `calculateWeeklyPace` /
-/// `calculateFiveHourPace` (dynamic sub-target, src/weekly-pace.ts). Returns
-/// `None` when the window carries no `reset_at` or its label is neither
-/// weekly nor 5h.
+/// `calculateFiveHourPace` / `rollingHoursEvenPace` (dynamic sub-target,
+/// src/weekly-pace.ts). Returns `None` when the window carries no `reset_at`
+/// or its label is neither weekly, 5h, nor a long rolling "<N>h" window.
 fn below_red_line(window: &UsageWindow, fetched_at: DateTime<Utc>) -> Option<bool> {
     if !window.used_percent.is_finite() {
         return None;
@@ -74,6 +83,9 @@ fn below_red_line(window: &UsageWindow, fetched_at: DateTime<Utc>) -> Option<boo
         (DAY_MS, WEEK_DAYS)
     } else if is_five_hour_label(&window.label) {
         (HOUR_MS, FIVE_HOUR_WINDOW_HOURS)
+    } else if let Some(hours) = rolling_hours_label(&window.label) {
+        // A "<N>h" window's period is its own duration; pace steps daily.
+        (DAY_MS, hours / 24.0)
     } else {
         return None;
     };
@@ -108,8 +120,9 @@ fn alert_key(window: &UsageWindow) -> String {
 /// red when tracking started. Exhaustion applies to every bar window —
 /// including monthly and reset-at-less windows, which carry no pace
 /// target — while the red-line check stays limited to weekly/5h windows
-/// with a `reset_at`. OpenRouter is exempt, mirroring the under-red-line
-/// guard in src/bar-summary.ts.
+/// and long rolling "<N>h" windows (e.g. Codex Free's 720h) with a
+/// `reset_at`. OpenRouter is exempt, mirroring the under-red-line guard
+/// in src/bar-summary.ts.
 pub fn detect_quota_events(
     prev: &UsageSnapshot,
     incoming: &UsageSnapshot,
@@ -141,7 +154,9 @@ pub fn detect_quota_events(
                 label: window.label.clone(),
             })
         } else if window.reset_at.is_some()
-            && (is_weekly_label(&window.label) || is_five_hour_label(&window.label))
+            && (is_weekly_label(&window.label)
+                || is_five_hour_label(&window.label)
+                || rolling_hours_label(&window.label).is_some())
             && below_red_line(window, incoming.fetched_at).unwrap_or(false)
         {
             Some(QuotaAlert::BelowRedLine {
@@ -516,6 +531,34 @@ mod tests {
     }
 
     #[test]
+    fn rolling_hours_window_uses_its_own_period() {
+        // Codex Free's 720h (30-day) quota: 28 days left of 30 → even-pace
+        // target ~93.3% remaining, sub-target ~91.2%. 60% left is far below
+        // the red line; 95% left stays quiet.
+        let now = Utc::now();
+        let reset = now + Duration::days(28);
+        let prev = snap_at(vec![win("720h", 30.0, Some(reset))], now);
+        let below = snap_at(
+            vec![win("720h", 40.0, Some(reset))],
+            now + Duration::minutes(1),
+        );
+        let events = detect_quota_events(&prev, &below, "codex", &no_alerts());
+        assert_eq!(
+            events.alerts,
+            vec![QuotaAlert::BelowRedLine {
+                label: "720h".into()
+            }]
+        );
+        let above = snap_at(
+            vec![win("720h", 5.0, Some(reset))],
+            now + Duration::minutes(1),
+        );
+        let events = detect_quota_events(&prev, &above, "codex", &no_alerts());
+        assert!(events.alerts.is_empty());
+        assert!(events.alert_keys.is_empty());
+    }
+
+    #[test]
     fn label_classification_matches_the_frontend() {
         assert!(is_weekly_label("weekly"));
         assert!(is_weekly_label("WK"));
@@ -527,6 +570,13 @@ mod tests {
         assert!(is_five_hour_label("5h · resets 14:00"));
         assert!(!is_five_hour_label("5h-ish"));
         assert!(!is_five_hour_label("weekly"));
+        assert_eq!(rolling_hours_label("720h"), Some(720.0));
+        assert_eq!(rolling_hours_label("24h"), Some(24.0));
+        // Sub-day windows and non-numeric labels get no rolling pace.
+        assert_eq!(rolling_hours_label("5h"), None);
+        assert_eq!(rolling_hours_label("1h"), None);
+        assert_eq!(rolling_hours_label("weekly"), None);
+        assert_eq!(rolling_hours_label("45m"), None);
     }
 
     #[test]
