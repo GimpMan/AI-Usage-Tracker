@@ -32,8 +32,8 @@ assert.equal(
 
 assert.equal(
   collapsedBarRemaining([window("cursor", 5), window("api", 40)]),
-  60,
-  "Cursor collapsed fill follows the tighter of the two pools",
+  95,
+  "Cursor collapsed fill follows Cursor Models, not Other Models",
 );
 
 console.log("collapsed bar tests passed");

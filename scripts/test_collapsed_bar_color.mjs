@@ -80,12 +80,12 @@ const underRedLine = (w, provider = "glm") => {
 }
 
 {
-  // Cursor dual pools: the more-behind window drives the collapsed fill.
+  // Cursor minibar follows Cursor Models even when Other Models is worse.
   const cursorModels = win("cursor", 5, { reset_at: "2026-07-31T12:00:00Z" });
   const otherModels = win("api", 90, { reset_at: "2026-07-31T12:00:00Z" });
-  const otherCp = paceColor(otherModels, "Cursor");
+  const modelsCp = paceColor(cursorModels, "Cursor");
   const got = collapsedBarColorPercent([cursorModels, otherModels], "Cursor", NOW);
-  assert.equal(got, otherCp, "case 5b: Cursor aggregate uses the worse pool");
+  assert.equal(got, modelsCp, "case 5b: Cursor fill uses Cursor Models, not Other Models");
 }
 
 // Case 6: weekly-only provider under red line -> weekly color (no 5h window,
