@@ -52,6 +52,7 @@ import openaiLogo from "./assets/openai-logo.svg";
 import grokLogo from "./assets/grok-logo.png";
 import openrouterLogo from "./assets/openrouter-logo.png";
 import kimiLogo from "./assets/kimi-logo.png";
+import cursorLogo from "./assets/cursor-logo.png";
 import brandLogo from "./assets/brand-logo.png";
 
 const currentWindow = getCurrentWindow();
@@ -649,18 +650,14 @@ function ProviderIcon({ id, size = 14 }: { id: string; size?: number }) {
         />
       );
     case "cursor":
-      // Cursor mark (two-wedge pointer) — inline so the bar doesn't depend on a raster.
       return (
-        <svg {...common} fill="none">
-          <path
-            fill="#e8e8e8"
-            d="M5 3.4 19.6 12 5 20.6l3.9-8.6L5 3.4z"
-          />
-          <path
-            fill="#9a9a9a"
-            d="M8.9 12 5 20.6 19.6 12H8.9z"
-          />
-        </svg>
+        <img
+          src={cursorLogo}
+          class="icon-svg"
+          style="object-fit:contain"
+          draggable={false}
+          alt="Cursor"
+        />
       );
     default:
       return (
