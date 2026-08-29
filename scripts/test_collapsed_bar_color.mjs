@@ -79,6 +79,15 @@ const underRedLine = (w, provider = "glm") => {
   assert.equal(got, monthlyCp, "case 5: OpenRouter aggregate keeps ahead/purple");
 }
 
+{
+  // Cursor dual pools: the more-behind window drives the collapsed fill.
+  const cursorModels = win("cursor", 5, { reset_at: "2026-07-31T12:00:00Z" });
+  const otherModels = win("api", 90, { reset_at: "2026-07-31T12:00:00Z" });
+  const otherCp = paceColor(otherModels, "Cursor");
+  const got = collapsedBarColorPercent([cursorModels, otherModels], "Cursor", NOW);
+  assert.equal(got, otherCp, "case 5b: Cursor aggregate uses the worse pool");
+}
+
 // Case 6: weekly-only provider under red line -> weekly color (no 5h window,
 // so the weekly window is the primary and drives the fill).
 {

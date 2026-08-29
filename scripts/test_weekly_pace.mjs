@@ -680,3 +680,30 @@ assert.equal(
 );
 
 console.log("rolling hours pace tests passed");
+
+const cursorMonthly = resolveEvenPace(
+  {
+    label: "api",
+    used_percent: 27.6,
+    reset_at: resetAfter(20),
+    bar_visible: true,
+  },
+  "Cursor",
+  now,
+);
+assert.ok(cursorMonthly, "Cursor Other Models pool should calendar-pace like Grok/OpenRouter");
+assert.equal(cursorMonthly.targetLabel, "monthly");
+assert.equal(
+  resolveEvenPace(
+    {
+      label: "api",
+      used_percent: 27.6,
+      reset_at: resetAfter(20),
+      bar_visible: true,
+    },
+    "Kimi Code",
+    now,
+  ),
+  null,
+  "api label is not paced on non-Cursor providers",
+);

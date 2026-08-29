@@ -178,7 +178,7 @@ mod tests {
         let tooltip = format_tray_tooltip(&snaps);
         assert_eq!(
             tooltip,
-            "GLM 60% wk | MiniMax 60% wk | Codex 60% wk | Claude 60% wk | Grok 60% wk | Kimi 60% wk | OpenRouter 60% wk"
+            "GLM 60% wk | MiniMax 60% wk | Codex 60% wk | Claude 60% wk | Grok 60% wk | Kimi 60% wk | OpenRouter 60% wk | Cursor 60% wk"
         );
         assert!(tooltip.chars().count() <= MAX_TOOLTIP_CHARS);
     }

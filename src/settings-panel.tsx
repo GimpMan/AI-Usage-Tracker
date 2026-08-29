@@ -96,6 +96,12 @@ const PROVIDERS: ProviderMeta[] = [
     hint: "API key (sk-or-v1-…) for per-key limits (daily, weekly, monthly, or lifetime). Optional Management key for account balance, top-ups, and rebase.",
     placeholder: "sk-or-v1-...",
   },
+  {
+    id: "cursor",
+    label: "Cursor",
+    hint: "Uses the signed-in Cursor account on this PC (Agent CLI auth.json or the IDE session). Tracks the Cursor Models and Other Models pools for the current billing cycle. Optional User API Key (crsr_…) from cursor.com/dashboard if Cursor isn't installed here.",
+    placeholder: "crsr_...",
+  },
 ];
 
 /** Only allow https (and http://localhost) for OAuth links rendered in the webview. */
@@ -812,7 +818,8 @@ function ProviderSection({
   const emptySaved =
     needsKey &&
     !hasSavedKey &&
-    !(meta.id === "openrouter" && hasSavedManagementKey);
+    !(meta.id === "openrouter" && hasSavedManagementKey) &&
+    !(meta.id === "cursor" && status?.configured);
 
   const savedBadge = dirty
     ? { text: "Unsaved changes", kind: "warn" as const }
@@ -826,7 +833,11 @@ function ProviderSection({
           ? status?.configured
             ? { text: "Signed in", kind: "ok" as const }
             : { text: "Not signed in", kind: "err" as const }
-          : { text: "Saved", kind: "ok" as const };
+          : meta.id === "cursor" && !hasSavedKey
+            ? status?.configured
+              ? { text: "Detected", kind: "ok" as const }
+              : { text: "Not detected", kind: "warn" as const }
+            : { text: "Saved", kind: "ok" as const };
 
   const unavailable = status && !status.registered;
   const claudeHint =
@@ -996,7 +1007,7 @@ function ProviderSection({
             <button
               class="action secondary"
               onClick={onTest}
-              disabled={busy || (!key.trim() && !hasSavedKey)}
+              disabled={busy || (!key.trim() && !hasSavedKey && meta.id !== "cursor")}
             >
               <PulseIcon />
               Test

@@ -470,13 +470,19 @@ function daysInCurrentMonth(nowMs: number): number {
 }
 
 /** Even-pace calculation for a daily or monthly limit window (OpenRouter
- *  spend caps, Grok's monthly included pool). */
+ *  spend caps, Grok's monthly included pool, Cursor's billing-cycle pools). */
 export function openrouterEvenPace(
   window: UsageWindow,
   nowMs = Date.now(),
 ): EvenPace | null {
   const label = window.label.trim().toLowerCase();
-  if (label !== "daily" && label !== "monthly") return null;
+  const isDaily = label === "daily";
+  const isMonthly =
+    label === "monthly" ||
+    label === "cursor" ||
+    label === "api" ||
+    label === "total";
+  if (!isDaily && !isMonthly) return null;
   if (!Number.isFinite(window.used_percent) || !window.reset_at) return null;
   const resetMs = Date.parse(window.reset_at);
   if (!Number.isFinite(resetMs) || resetMs <= nowMs) return null;
@@ -484,7 +490,7 @@ export function openrouterEvenPace(
   const remainingPercent = clampPercent(100 - window.used_percent);
   const timeLeftMs = resetMs - nowMs;
 
-  if (label === "daily") {
+  if (isDaily) {
     const periodMs = DAY_MS; // 24h
     const hoursLeft = timeLeftMs / HOUR_MS;
     const hourlyQuotaPercent = remainingPercent / hoursLeft;
@@ -578,9 +584,9 @@ export function dollarMonthlyProjectionNote(
 }
 
 /** Providers whose daily/monthly windows are calendar-paced: OpenRouter
- *  spend caps and Grok's monthly included pool are plain usage pools.
- *  Z.ai's monthly window is a tool-use quota and stays unpaced. */
-const CALENDAR_PACE_PROVIDERS = ["openrouter", "grok"];
+ *  spend caps, Grok's monthly included pool, and Cursor's billing-cycle
+ *  pools. Z.ai's monthly window is a tool-use quota and stays unpaced. */
+const CALENDAR_PACE_PROVIDERS = ["openrouter", "grok", "cursor"];
 
 /** Resolve any window to its EvenPace, or null when no pace applies.
  *  5h, weekly, and long rolling "<N>h" windows (e.g. Codex Free's 720h)

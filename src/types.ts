@@ -27,7 +27,8 @@ export type ProviderId =
   | "claude"
   | "grok"
   | "kimi"
-  | "openrouter";
+  | "openrouter"
+  | "cursor";
 
 export type UpdatePhase =
   | "idle"

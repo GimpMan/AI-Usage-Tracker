@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod claude;
 pub mod codex;
+pub mod cursor;
 pub mod glm;
 pub mod grok;
 pub mod kimi;
@@ -19,6 +20,7 @@ pub const PROVIDER_IDS: &[&str] = &[
     "grok",
     "kimi",
     "openrouter",
+    "cursor",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +198,9 @@ pub(crate) fn short_window_label(label: &str) -> &str {
         "monthly" | "mo" => "mo",
         "5h" | "session" => "5h",
         "3h" => "3h",
+        "cursor" => "cur",
+        "api" => "api",
+        "total" => "tot",
         _ => label,
     }
 }
@@ -211,6 +216,7 @@ pub fn short_provider_name(id: &str) -> String {
         "grok" => "Grok",
         "kimi" => "Kimi",
         "openrouter" => "OpenRouter",
+        "cursor" => "Cursor",
         _ => id,
     }
     .to_string()
@@ -311,6 +317,7 @@ mod tests {
         assert_eq!(short_provider_name("glm"), "GLM");
         assert_eq!(short_provider_name("minimax"), "MiniMax");
         assert_eq!(short_provider_name("openrouter"), "OpenRouter");
+        assert_eq!(short_provider_name("cursor"), "Cursor");
         assert_eq!(short_provider_name("unknown-id"), "unknown-id");
     }
 }

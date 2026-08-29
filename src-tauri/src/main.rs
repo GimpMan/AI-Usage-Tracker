@@ -24,8 +24,9 @@ use tokio::sync::RwLock;
 
 use commands::secrets_handle;
 use providers::{
-    claude::ClaudeProvider, codex::CodexProvider, glm::GlmProvider, grok::GrokProvider,
-    kimi::KimiProvider, minimax::MinimaxProvider, openrouter::OpenrouterProvider, Provider,
+    claude::ClaudeProvider, codex::CodexProvider, cursor::CursorProvider, glm::GlmProvider,
+    grok::GrokProvider, kimi::KimiProvider, minimax::MinimaxProvider,
+    openrouter::OpenrouterProvider, Provider,
 };
 use scheduler::Scheduler;
 
@@ -85,9 +86,10 @@ fn has_active_claude_subscription() -> bool {
 
 /// Build the provider list. Z.ai Coding Plan + MiniMax Coding Plan (live) + Codex CLI (local)
 /// + Grok SuperGrok/Build (local OIDC auth) + OpenRouter (prepaid credits via
-/// bearer key). Claude Code is only included when an active OAuth subscription
-/// is detected — otherwise stale session files from a lapsed plan would make
-/// the bar render an irrelevant "no recent usage" segment.
+/// bearer key) + Cursor (local session or User API Key). Claude Code is only
+/// included when an active OAuth subscription is detected — otherwise stale
+/// session files from a lapsed plan would make the bar render an irrelevant
+/// "no recent usage" segment.
 pub fn build_providers() -> Vec<Box<dyn Provider>> {
     let mut providers: Vec<Box<dyn Provider>> = vec![
         Box::new(GlmProvider),
@@ -96,6 +98,7 @@ pub fn build_providers() -> Vec<Box<dyn Provider>> {
         Box::new(GrokProvider),
         Box::new(KimiProvider),
         Box::new(OpenrouterProvider),
+        Box::new(CursorProvider),
     ];
     if has_active_claude_subscription() {
         providers.push(Box::new(ClaudeProvider));

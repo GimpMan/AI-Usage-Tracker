@@ -198,6 +198,7 @@ fn provider_label(id: &str) -> &'static str {
         "grok" => "Grok (SuperGrok / Build)",
         "kimi" => "Kimi Code",
         "openrouter" => "OpenRouter",
+        "cursor" => "Cursor",
         _ => "Unknown provider",
     }
 }
@@ -246,6 +247,16 @@ fn provider_configured_local(id: &str, registered: bool) -> (bool, Option<String
             "codex" => classify_local_oauth("codex"),
             "kimi" => classify_local_oauth("kimi"),
             "claude" => (true, None),
+            "cursor" => {
+                if Secrets.get("cursor").is_some() || crate::providers::cursor::has_local_session() {
+                    (true, None)
+                } else {
+                    (
+                        false,
+                        Some(crate::providers::cursor::REASON_NO_AUTH_STATUS.to_string()),
+                    )
+                }
+            }
             _ => (true, None),
         }
     }
@@ -627,6 +638,11 @@ pub async fn test_key(
     key: Option<String>,
     region: Option<String>,
 ) -> Result<String, String> {
+    if provider == "cursor" {
+        let draft = key.filter(|k| !k.trim().is_empty());
+        let stored = Secrets.get("cursor");
+        return crate::providers::cursor::test_key(draft.as_deref().or(stored.as_deref())).await;
+    }
     let actual = match key {
         Some(k) if !k.trim().is_empty() => k,
         _ => match Secrets.get(&provider) {

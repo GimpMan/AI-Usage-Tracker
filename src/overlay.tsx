@@ -77,6 +77,8 @@ const SOFT_EMPTY_REASONS = new Set<string>([
   "session expired — run grok login",
   "no usage data yet",
   "no auth found — sign in with Kimi",
+  "no auth found — sign in to Cursor or paste a User API Key",
+  "session expired — sign in to Cursor",
 ]);
 
 /**
@@ -150,6 +152,7 @@ function iconIdFor(label: string): string {
   if (l.includes("grok") || l.includes("xai") || l.includes("x.ai")) return "grok";
   if (l.includes("kimi") || l.includes("moonshot")) return "kimi";
   if (l.includes("openrouter")) return "openrouter";
+  if (l.includes("cursor")) return "cursor";
   return "default";
 }
 
@@ -161,6 +164,7 @@ const PROVIDER_IDS: readonly ProviderId[] = [
   "grok",
   "kimi",
   "openrouter",
+  "cursor",
 ];
 
 /** Map a snapshot provider label to the backend provider id for refresh. */
@@ -369,6 +373,8 @@ function shortLabel(label: string): string {
   if (l === "daily") return "day";
   if (l === "monthly") return "mo";
   if (l === "session") return "5h";
+  if (l === "cursor") return "cur";
+  if (l === "total") return "tot";
   return l;
 }
 
@@ -389,6 +395,11 @@ function prettyLabel(label: string, provider?: string): string {
     return provider === "Z.ai Coding Plan" ? "Monthly Tool Use" : "Monthly";
   if (l === "5h") return "5-Hour Window";
   if (l === "3h") return "3-Hour Window";
+  if (l === "cursor") return "Cursor Models";
+  if (provider === "Cursor") {
+    if (l === "api") return "Other Models";
+    if (l === "total") return "Included usage";
+  }
   return label;
 }
 
@@ -636,6 +647,20 @@ function ProviderIcon({ id, size = 14 }: { id: string; size?: number }) {
           draggable={false}
           alt="MiniMax"
         />
+      );
+    case "cursor":
+      // Cursor mark (two-wedge pointer) — inline so the bar doesn't depend on a raster.
+      return (
+        <svg {...common} fill="none">
+          <path
+            fill="#e8e8e8"
+            d="M5 3.4 19.6 12 5 20.6l3.9-8.6L5 3.4z"
+          />
+          <path
+            fill="#9a9a9a"
+            d="M8.9 12 5 20.6 19.6 12H8.9z"
+          />
+        </svg>
       );
     default:
       return (
@@ -1307,10 +1332,12 @@ function Popup({
         // 5h/weekly windows; real counters (e.g. 250 / 1,000) stay.
         const providerId = providerIdFor(snap.provider);
         const openrouterW = providerId === "openrouter";
+        const cursorW = providerId === "cursor";
+        const dollarW = openrouterW || cursorW;
         const percentMirror = (weeklyW || fiveHourW) && w.limit_absolute === 100;
         const absoluteNote =
           w.used_absolute != null && w.limit_absolute != null
-            ? openrouterW
+            ? dollarW
               ? `$${w.used_absolute.toFixed(2)} / $${w.limit_absolute.toFixed(2)} used`
               : percentMirror
                 ? null

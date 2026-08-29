@@ -8,6 +8,21 @@ import {
 
 export function collapsedBarRemaining(windows: UsageWindow[]): number {
   const visible = windows.filter((window) => window.bar_visible);
+  // Cursor Models + Other Models: fill width follows the tighter pool.
+  const cursorPools = visible.filter(
+    (window) => window.label === "cursor" || window.label === "api",
+  );
+  if (cursorPools.length > 0) {
+    const capped = cursorPools.filter((window) => !window.is_unlimited);
+    if (capped.length === 0) return 100;
+    return Math.max(
+      0,
+      Math.min(
+        100,
+        Math.min(...capped.map((window) => 100 - window.used_percent)),
+      ),
+    );
+  }
   const primary =
     visible.find((window) => isFiveHourWindow(window.label)) ?? visible[0];
   if (!primary) return 100;
@@ -37,6 +52,24 @@ function aggregateColorPercent(
   return aheadPercent > 0 ? aheadPercent : behindPercent;
 }
 
+function cursorAggregateColorPercent(
+  visible: UsageWindow[],
+  providerLabel: string,
+  nowMs: number,
+): number {
+  let worst = 100;
+  let sawCapped = false;
+  for (const w of visible) {
+    if (w.is_unlimited) continue;
+    sawCapped = true;
+    const remaining = Math.max(0, 100 - w.used_percent);
+    const cp =
+      resolveEvenPace(w, providerLabel, nowMs)?.gradientPercent ?? remaining;
+    worst = Math.min(worst, cp);
+  }
+  return sawCapped ? worst : 100;
+}
+
 export function collapsedBarColorPercent(
   windows: UsageWindow[],
   providerLabel: string,
@@ -47,6 +80,11 @@ export function collapsedBarColorPercent(
 
   if (providerLabel.toLowerCase().includes("openrouter")) {
     return aggregateColorPercent(visible, providerLabel, nowMs);
+  }
+  if (providerLabel.toLowerCase().includes("cursor")) {
+    // Dual billing-cycle pools: the overlay fill follows the pool closest
+    // to empty, not the one that's ahead of even pace.
+    return cursorAggregateColorPercent(visible, providerLabel, nowMs);
   }
 
   // Mini bar fill color reflects only the primary (5h) window. The weekly

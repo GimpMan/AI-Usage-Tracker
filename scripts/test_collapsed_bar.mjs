@@ -30,4 +30,10 @@ assert.equal(
   "remaining percentage must be clamped",
 );
 
+assert.equal(
+  collapsedBarRemaining([window("cursor", 5), window("api", 40)]),
+  60,
+  "Cursor collapsed fill follows the tighter of the two pools",
+);
+
 console.log("collapsed bar tests passed");
