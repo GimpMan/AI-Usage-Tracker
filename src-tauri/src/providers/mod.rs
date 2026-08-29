@@ -130,11 +130,16 @@ pub fn classify_snapshot(snapshot: UsageSnapshot) -> ProviderFetch {
         || lower.contains("403")
         || lower.contains("session expired")
         || lower.contains("auth mode");
+    // "429" without an "http " prefix: Kimi answers "api 429 Too Many
+    // Requests" while rate-limited. A rate limit is the textbook transient
+    // failure — hard-failing it made a signed-in provider ineligible and
+    // desynced the Settings toggle from the bar.
     let is_transient = lower.contains("network")
         || lower.contains("transport")
         || lower.contains("timeout")
         || lower.contains("decode")
         || lower.contains("http ")
+        || lower.contains("429")
         || lower.contains("join:")
         || lower.contains("stale local log");
 
@@ -265,6 +270,22 @@ mod tests {
         let fetch = classify_snapshot(UsageSnapshot::unavailable(
             "MiniMax Coding Plan",
             "network error: login failed at all endpoints",
+        ));
+        assert!(matches!(fetch.health, ProviderHealth::TransientFailure));
+        assert!(fetch.snapshot.is_none());
+    }
+
+    #[test]
+    fn http_429_rate_limit_is_transient() {
+        // Regression: Kimi's usage endpoint answers "api 429 Too Many
+        // Requests" while rate-limited. The reason has no "http " prefix and
+        // matched no transient keyword, so it fell through to
+        // hard(NoUsableDetails) — a signed-in provider became ineligible and
+        // the Settings Overlay switch force-rendered off while the bar kept
+        // rendering the provider's stale segment.
+        let fetch = classify_snapshot(UsageSnapshot::unavailable(
+            "Kimi Code",
+            "api 429 Too Many Requests",
         ));
         assert!(matches!(fetch.health, ProviderHealth::TransientFailure));
         assert!(fetch.snapshot.is_none());

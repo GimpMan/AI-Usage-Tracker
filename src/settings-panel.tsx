@@ -152,6 +152,24 @@ function writeHiddenCacheAll(statuses: ProviderStatus[]) {
   }
 }
 
+/** Mirror of the backend's `auto_hide` condition in commands.rs
+ *  `provider_statuses`: only these cases are force-hidden on disk
+ *  (unregistered, unconfigured, or credentials missing — nothing to track).
+ *  Recoverable failures on a registered + configured provider (rate limit,
+ *  rejected key, upstream schema drift) deliberately keep the saved
+ *  visibility flag so the bar segment can recover on its own. For those the
+ *  switch must reflect the saved flag and stay operable — forcing it to
+ *  render "off" desynced it from the bar (Kimi showed a segment while the
+ *  toggle claimed it was hidden). */
+function backendAutoHides(status: ProviderStatus): boolean {
+  return (
+    !status.eligible &&
+    (!status.registered ||
+      !status.configured ||
+      status.health === "MissingCredentials")
+  );
+}
+
 function ProviderSection({
   meta,
   status,
@@ -179,9 +197,11 @@ function ProviderSection({
     const v = readHiddenCache()[meta.id];
     return typeof v === "boolean" ? v : null;
   });
-  // Not registered (e.g. Claude with no Pro/Max session) can never appear on
-  // the bar — force the checkbox off regardless of a stale "shown" preference.
-  const forceHidden = statusReady && !!status && !status.eligible;
+  // Only the backend's auto-hide cases (unregistered / unconfigured / no
+  // credentials — see backendAutoHides) can never appear on the bar; there
+  // the saved flag is already forced true on disk. For everything else the
+  // switch mirrors the saved flag so hide/show stays honest and operable.
+  const forceHidden = statusReady && !!status && backendAutoHides(status);
   const userHidden = hiddenOverride ?? status?.hidden ?? cachedHidden ?? false;
   const hidden = forceHidden || userHidden;
   // Only dim the card when the user intentionally hid a *registered* provider.
@@ -354,13 +374,15 @@ function ProviderSection({
     if (status.hidden === hiddenOverride) setHiddenOverride(null);
   }, [status?.hidden, hiddenOverride, meta.id]);
 
-  // Mirror backend auto-hide: when a provider is not eligible, keep the
-  // local cache/override on "hidden" so the checkbox doesn't sit ticked.
+  // Mirror backend auto-hide: only when the backend force-hides the provider
+  // on disk (backendAutoHides) keep the local cache/override on "hidden" so
+  // the checkbox doesn't sit ticked. Recoverable failures must not touch the
+  // override — the backend keeps the provider visible there.
   useEffect(() => {
-    if (!status || status.eligible) return;
+    if (!status || !backendAutoHides(status)) return;
     writeHiddenCache(meta.id, true);
     if (hiddenOverride === false) setHiddenOverride(true);
-  }, [status?.eligible, status?.hidden, meta.id, hiddenOverride]);
+  }, [status, meta.id, hiddenOverride]);
 
   // Never leave a green "shown" banner under a provider that is forced off
   // (not detected) — that message is leftover from a failed/racy toggle.
