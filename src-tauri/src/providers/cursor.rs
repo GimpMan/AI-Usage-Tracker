@@ -231,7 +231,7 @@ fn fingerprint_key(key: &str) -> String {
 
 #[derive(Deserialize)]
 struct ExchangeResponse {
-    #[serde(default, alias = "access_token")]
+    #[serde(default, alias = "accessToken")]
     access_token: Option<String>,
 }
 
@@ -653,6 +653,18 @@ mod tests {
         );
         assert!(access_token_from_auth_json(&json!({"accessToken":"  "})).is_none());
         assert!(access_token_from_auth_json(&json!({})).is_none());
+    }
+
+    #[test]
+    fn exchange_response_accepts_camel_and_snake_access_token() {
+        let camel: ExchangeResponse =
+            serde_json::from_str(r#"{"accessToken":"tok-camel","refreshToken":"r"}"#)
+                .expect("camelCase exchange json");
+        assert_eq!(camel.access_token.as_deref(), Some("tok-camel"));
+
+        let snake: ExchangeResponse =
+            serde_json::from_str(r#"{"access_token":"tok-snake"}"#).expect("snake_case exchange json");
+        assert_eq!(snake.access_token.as_deref(), Some("tok-snake"));
     }
 
     #[test]
