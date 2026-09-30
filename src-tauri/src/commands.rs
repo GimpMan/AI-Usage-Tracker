@@ -475,6 +475,8 @@ pub async fn load_region(provider: String) -> Result<Option<String>, String> {
 /// post-save-key hook. Hidden providers are filtered out so they neither fetch
 /// nor occupy snapshot slots. Each provider busy-checks its lock (2s retry).
 async fn do_refresh(app: &tauri::AppHandle, state: &crate::AppState) {
+    // Manual Recheck: force a plan re-read so a fresh Pro/Max sign-in registers.
+    crate::oauth::claude::ensure_session(true).await;
     let providers: Vec<Box<dyn crate::providers::Provider>> = crate::build_providers()
         .into_iter()
         .filter(|p| !crate::secrets::is_hidden(p.id()))
@@ -554,6 +556,9 @@ async fn do_refresh_provider(
     }
     if crate::secrets::is_hidden(provider_id) {
         return Err(format!("{provider_id}: hidden in settings"));
+    }
+    if provider_id == "claude" {
+        crate::oauth::claude::ensure_session(false).await;
     }
     let Some(provider) = crate::build_providers()
         .into_iter()

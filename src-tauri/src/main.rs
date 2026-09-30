@@ -234,6 +234,9 @@ fn main() {
                     app.handle().clone(),
                 );
                 tauri::async_runtime::spawn(async move {
+                    // Refresh first so an expired-but-refreshable Claude session
+                    // still counts as registered when persisted state loads.
+                    oauth::claude::ensure_session(false).await;
                     // Warm cache from disk so first open is instant.
                     scheduler::load_persisted(&snapshots).await;
                     crate::history::load_history(&history).await;

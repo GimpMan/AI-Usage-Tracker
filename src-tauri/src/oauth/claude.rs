@@ -7,6 +7,7 @@
 //! Tokens are stored in Windows Credential Manager (app-only). The Claude CLI
 //! keeps a separate login under `~/.claude/`.
 
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Instant;
 
 use serde::Deserialize;
@@ -197,7 +198,9 @@ pub async fn complete(session: &OAuthSession, pasted: &str) -> Result<OAuthPoll,
         .collect();
 
     // Best-effort profile for subscriptionType (needed for provider registration).
-    let (subscription_type, rate_limit_tiers) = fetch_subscription_meta(&client, &access).await;
+    let meta = fetch_subscription_meta(&client, &access).await;
+    let profile_read = meta.is_some();
+    let (subscription_type, rate_limit_tiers) = meta.unwrap_or((None, None));
 
     persist_tokens(
         &access,
@@ -210,12 +213,18 @@ pub async fn complete(session: &OAuthSession, pasted: &str) -> Result<OAuthPoll,
         body.organization.as_ref(),
     )?;
 
+    let message = match (subscription_type.as_deref(), profile_read) {
+        (Some(plan), _) => format!("Signed in to Claude ({plan} plan). Claude Code is now on the bar."),
+        (None, true) => "Signed in, but this Claude account has no Pro/Max plan — Claude stays off the bar."
+            .to_string(),
+        (None, false) => {
+            "Signed in, but the plan could not be read. Press Recheck to try again.".to_string()
+        }
+    };
+
     Ok(OAuthPoll {
         status: "complete".into(),
-        message: Some(
-            "Signed in to Claude. Pro/Max plans show on the bar after Recheck; free plans stay local-only."
-                .into(),
-        ),
+        message: Some(message),
         provider: Some("claude".into()),
         user_code: None,
         session_id: Some(session.id.clone()),
@@ -257,40 +266,221 @@ fn split_code_state(s: &str) -> (String, Option<String>) {
     }
 }
 
+/// `(subscription_type, rate_limit_tier)`; `None` from the fetch means the
+/// profile could not be read at all (network / auth), as opposed to a readable
+/// profile that simply has no paid plan.
+type SubscriptionMeta = (Option<String>, Option<String>);
+
 async fn fetch_subscription_meta(
     client: &reqwest::Client,
     access: &str,
-) -> (Option<String>, Option<String>) {
-    let resp = match client
+) -> Option<SubscriptionMeta> {
+    let resp = client
         .get(PROFILE_URL)
         .bearer_auth(access)
         .header("Content-Type", "application/json")
         .header("anthropic-beta", "oauth-2025-04-20")
         .send()
         .await
-    {
-        Ok(r) => r,
-        Err(_) => return (None, None),
-    };
+        .ok()?;
     if !resp.status().is_success() {
-        return (None, None);
+        log::warn!("claude oauth: profile http {}", resp.status());
+        return None;
     }
-    let v: Value = match resp.json().await {
-        Ok(v) => v,
-        Err(_) => return (None, None),
-    };
-    let sub = v
+    let v: Value = resp.json().await.ok()?;
+    Some(subscription_from_profile(&v))
+}
+
+/// Map the `/api/oauth/profile` body to `(subscriptionType, rateLimitTier)`.
+///
+/// The endpoint has no `subscriptionType` field. The Claude CLI derives it
+/// from `organization.organization_type` (`claude_max` → `max`, `claude_pro`
+/// → `pro`, `claude_team` → `team`, `claude_enterprise` → `enterprise`), so we
+/// do the same, falling back to `account.has_claude_max/pro`. Free accounts
+/// (`claude_free`, or no flags) yield `None`.
+fn subscription_from_profile(v: &Value) -> SubscriptionMeta {
+    let explicit = v
         .get("subscriptionType")
         .or_else(|| v.pointer("/account/subscriptionType"))
         .or_else(|| v.pointer("/organization/subscriptionType"))
-        .and_then(|x| x.as_str())
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let tiers = v
+
+    let from_org = v
+        .pointer("/organization/organization_type")
+        .and_then(Value::as_str)
+        .and_then(|t| match t {
+            "claude_max" => Some("max"),
+            "claude_pro" => Some("pro"),
+            "claude_team" => Some("team"),
+            "claude_enterprise" => Some("enterprise"),
+            _ => None,
+        })
+        .map(str::to_string);
+
+    let flag = |p: &str| v.pointer(p).and_then(Value::as_bool).unwrap_or(false);
+    let from_flags = if flag("/account/has_claude_max") {
+        Some("max".to_string())
+    } else if flag("/account/has_claude_pro") {
+        Some("pro".to_string())
+    } else {
+        None
+    };
+
+    let sub = explicit.or(from_org).or(from_flags);
+    let tier = v
         .get("rateLimitTier")
+        .or_else(|| v.pointer("/organization/rate_limit_tier"))
         .or_else(|| v.pointer("/account/rateLimitTier"))
-        .and_then(|x| x.as_str())
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
         .map(str::to_string);
-    (sub, tiers)
+    (sub, tier)
+}
+
+static LAST_PROFILE_ATTEMPT_MS: AtomicI64 = AtomicI64::new(0);
+/// Free / undetected accounts are re-checked at most this often on the
+/// background cycle; the manual Recheck bypasses it.
+const PROFILE_RETRY_MS: i64 = 10 * 60 * 1000;
+
+/// Keep the stored app session usable.
+///
+/// * Refreshes the access token (8h lifetime) shortly before it expires —
+///   only for sessions this app created (`appManaged`), because refresh tokens
+///   rotate and refreshing a session imported from the CLI would sign the CLI out.
+/// * Re-reads the plan when `subscriptionType` is missing, which repairs
+///   sessions stored before the profile parser understood `organization_type`
+///   and picks up a plan bought after signing in.
+///
+/// Best-effort: failures are logged and leave the stored session untouched.
+pub async fn ensure_session(force: bool) {
+    let Some(mut root) = secrets::oauth_get_json("claude") else {
+        return;
+    };
+    let app_managed = root.get("appManaged").and_then(Value::as_bool) == Some(true);
+    let Some(oauth) = root
+        .get_mut("claudeAiOauth")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    let Ok(client) = http_client() else {
+        return;
+    };
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut dirty = false;
+    let mut refreshed = false;
+
+    let expires_at = oauth.get("expiresAt").and_then(Value::as_i64).unwrap_or(0);
+    if app_managed && expires_at > 0 && expires_at <= now_ms + 60_000 {
+        let refresh = oauth
+            .get("refreshToken")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if let Some(rt) = refresh {
+            match refresh_access_token(&client, &rt).await {
+                Ok(t) => {
+                    oauth.insert("accessToken".into(), Value::String(t.access));
+                    oauth.insert(
+                        "expiresAt".into(),
+                        json!(now_ms + (t.expires_in as i64) * 1000),
+                    );
+                    if let Some(new_rt) = t.refresh {
+                        oauth.insert("refreshToken".into(), Value::String(new_rt));
+                    }
+                    if let Some(scopes) = t.scopes {
+                        oauth.insert("scopes".into(), json!(scopes));
+                    }
+                    dirty = true;
+                    refreshed = true;
+                    log::info!("claude oauth: refreshed access token");
+                }
+                Err(e) => log::warn!("claude oauth: token refresh failed: {e}"),
+            }
+        }
+    }
+
+    let access = oauth
+        .get("accessToken")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let expires_at = oauth.get("expiresAt").and_then(Value::as_i64).unwrap_or(0);
+    let token_live = !access.is_empty() && (expires_at <= 0 || expires_at > now_ms);
+    let sub_missing = oauth
+        .get("subscriptionType")
+        .map_or(true, Value::is_null);
+    let retry_due =
+        force || now_ms - LAST_PROFILE_ATTEMPT_MS.load(Ordering::Relaxed) >= PROFILE_RETRY_MS;
+
+    if token_live && (refreshed || (sub_missing && retry_due)) {
+        LAST_PROFILE_ATTEMPT_MS.store(now_ms, Ordering::Relaxed);
+        if let Some((sub, tier)) = fetch_subscription_meta(&client, &access).await {
+            let new_sub = sub.map_or(Value::Null, Value::String);
+            let new_tier = tier.map_or(Value::Null, Value::String);
+            if oauth.get("subscriptionType") != Some(&new_sub)
+                || oauth.get("rateLimitTier") != Some(&new_tier)
+            {
+                oauth.insert("subscriptionType".into(), new_sub);
+                oauth.insert("rateLimitTier".into(), new_tier);
+                dirty = true;
+            }
+        }
+    }
+
+    if dirty {
+        if let Err(e) = secrets::oauth_set_json("claude", &root) {
+            log::warn!("claude oauth: could not store updated session: {e}");
+        }
+    }
+}
+
+struct RefreshedToken {
+    access: String,
+    refresh: Option<String>,
+    expires_in: u64,
+    scopes: Option<Vec<String>>,
+}
+
+async fn refresh_access_token(
+    client: &reqwest::Client,
+    refresh_token: &str,
+) -> Result<RefreshedToken, String> {
+    let resp = client
+        .post(TOKEN_URL)
+        .header("Accept", "application/json")
+        .json(&json!({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": CLIENT_ID,
+            "scope": SCOPES,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("request: {e}"))?;
+    let status = resp.status();
+    let body: TokenResponse = resp.json().await.map_err(|e| format!("decode: {e}"))?;
+    if let Some(err) = body.error {
+        return Err(format!("{err} (http {status})"));
+    }
+    if !status.is_success() {
+        return Err(format!("http {status}"));
+    }
+    let access = body
+        .access_token
+        .filter(|s| !s.is_empty())
+        .ok_or("missing access_token")?;
+    Ok(RefreshedToken {
+        access,
+        refresh: body.refresh_token.filter(|s| !s.is_empty()),
+        expires_in: body.expires_in.unwrap_or(28_800),
+        scopes: body
+            .scope
+            .map(|s| s.split_whitespace().map(str::to_string).collect()),
+    })
 }
 
 fn persist_tokens(
@@ -324,6 +514,9 @@ fn persist_tokens(
             .insert("refreshToken".into(), Value::String(rt.to_string()));
     }
     root.insert("claudeAiOauth".into(), oauth);
+    // Marks a session this app minted itself; only those may be refreshed (a
+    // session imported from the CLI shares a rotating refresh token with it).
+    root.insert("appManaged".into(), Value::Bool(true));
 
     // Keep account metadata inside the app blob (not in ~/.claude.json).
     if let (Some(acc), Some(o)) = (account, org) {
@@ -353,4 +546,59 @@ fn persist_tokens(
 pub fn logout() -> Result<String, String> {
     secrets::oauth_delete("claude").map_err(|e| e.to_string())?;
     Ok("Claude app sign-in cleared (CLI login unchanged)".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_max_org_maps_to_max_and_reads_tier() {
+        let v = json!({
+            "account": { "has_claude_max": true, "has_claude_pro": false },
+            "organization": {
+                "organization_type": "claude_max",
+                "rate_limit_tier": "default_claude_max_5x"
+            }
+        });
+        let (sub, tier) = subscription_from_profile(&v);
+        assert_eq!(sub.as_deref(), Some("max"));
+        assert_eq!(tier.as_deref(), Some("default_claude_max_5x"));
+    }
+
+    #[test]
+    fn profile_org_types_map_to_plan_names() {
+        for (org, want) in [
+            ("claude_pro", "pro"),
+            ("claude_team", "team"),
+            ("claude_enterprise", "enterprise"),
+        ] {
+            let v = json!({ "organization": { "organization_type": org } });
+            assert_eq!(subscription_from_profile(&v).0.as_deref(), Some(want));
+        }
+    }
+
+    #[test]
+    fn profile_falls_back_to_account_flags() {
+        let v = json!({ "account": { "has_claude_pro": true } });
+        assert_eq!(subscription_from_profile(&v).0.as_deref(), Some("pro"));
+    }
+
+    #[test]
+    fn profile_free_account_has_no_subscription() {
+        let v = json!({
+            "account": { "has_claude_max": false, "has_claude_pro": false },
+            "organization": { "organization_type": "claude_free" }
+        });
+        assert_eq!(subscription_from_profile(&v), (None, None));
+    }
+
+    #[test]
+    fn profile_explicit_subscription_type_still_wins() {
+        let v = json!({
+            "subscriptionType": "max",
+            "organization": { "organization_type": "claude_pro" }
+        });
+        assert_eq!(subscription_from_profile(&v).0.as_deref(), Some("max"));
+    }
 }

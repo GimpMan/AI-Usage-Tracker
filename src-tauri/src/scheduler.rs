@@ -217,6 +217,9 @@ impl Scheduler {
     /// events (window resets, threshold alerts) are dispatched per provider
     /// after its locks drop; the tray tooltip is rewritten after persist.
     pub async fn refresh_once(&self) {
+        // Runs before build_providers so a refreshed token / newly detected
+        // plan registers Claude in this same cycle.
+        crate::oauth::claude::ensure_session(false).await;
         let providers: Vec<Box<dyn crate::providers::Provider>> = crate::build_providers()
             .into_iter()
             .filter(|p| !crate::secrets::is_hidden(p.id()))

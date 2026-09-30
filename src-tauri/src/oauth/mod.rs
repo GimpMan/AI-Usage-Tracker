@@ -5,7 +5,7 @@
 //! **closing Settings does not lose the device code**. Device-code providers
 //! also get a **background poller** that finishes login even if the UI is closed.
 
-mod claude;
+pub(crate) mod claude;
 pub(crate) mod codex;
 mod grok;
 mod kimi;
