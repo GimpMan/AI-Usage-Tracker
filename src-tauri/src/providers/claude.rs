@@ -1,11 +1,5 @@
-use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
-
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, Utc};
-use serde::Deserialize;
+use chrono::{DateTime, Utc};
 
 use super::{classify_snapshot, Provider, ProviderFetch, UsageSnapshot, UsageWindow};
 use crate::secrets::Secrets;
@@ -13,9 +7,12 @@ use crate::secrets::Secrets;
 const PROVIDER_LABEL: &str = "Claude Code";
 const PROVIDER_ID: &str = "claude";
 
-/// Only the trailing 7d window is needed. Cap first-read / cold-start tails so
-/// multi-hundred-MB session logs do not get fully loaded every tick.
-const MAX_TAIL_BYTES: u64 = 4 * 1024 * 1024;
+const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const LIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// Contains "session expired" so `classify_snapshot` treats it as invalid credentials.
+const REASON_EXPIRED: &str = "session expired — sign in to Claude again";
+/// Contains "no auth" so `classify_snapshot` treats it as missing credentials.
+const REASON_NO_AUTH: &str = "no auth found — sign in to Claude";
 
 pub struct ClaudeProvider;
 
@@ -28,449 +25,375 @@ impl Provider for ClaudeProvider {
         PROVIDER_LABEL
     }
 
+    /// Live 5h / weekly plan limits from the app's own OAuth session — the
+    /// same endpoint the Claude CLI's `/usage` reads. Token refresh and plan
+    /// detection happen in `oauth::claude::ensure_session` before each cycle.
     async fn fetch(&self, _secrets: &Secrets) -> ProviderFetch {
-        match tokio::task::spawn_blocking(read_claude_snapshot).await {
-            Ok(Ok(snap)) => classify_snapshot(snap),
-            Ok(Err(msg)) => classify_snapshot(UsageSnapshot::unavailable(PROVIDER_LABEL, msg)),
-            Err(e) => classify_snapshot(UsageSnapshot::unavailable(
-                PROVIDER_LABEL,
-                format!("join: {e}"),
-            )),
+        let Some(session) = stored_session() else {
+            return classify_snapshot(UsageSnapshot::unavailable(PROVIDER_LABEL, REASON_NO_AUTH));
+        };
+
+        match fetch_live_windows(&session.token).await {
+            Ok(windows) => {
+                log::info!(
+                    "claude usage: {}",
+                    windows
+                        .iter()
+                        .map(|w| format!("{}={:.0}%", w.label, w.used_percent))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                classify_snapshot(UsageSnapshot {
+                    provider: PROVIDER_LABEL.to_string(),
+                    level: session.plan,
+                    windows,
+                    unavailable_reason: None,
+                    fetched_at: Utc::now(),
+                })
+            }
+            Err(reason) => {
+                log::warn!("claude usage: fetch failed: {reason}");
+                classify_snapshot(UsageSnapshot::unavailable(PROVIDER_LABEL, reason))
+            }
         }
     }
 }
 
-#[derive(Clone, Copy)]
-struct FileCursor {
-    /// Byte offset of the next unread byte (equal to last known length when fully read).
-    offset: u64,
-    /// Last observed file length — shrinks trigger a rescan of that file's tail.
-    len: u64,
+struct Session {
+    token: String,
+    /// Popup subtitle, e.g. "Max 5x" or "Pro".
+    plan: Option<String>,
 }
 
-struct UsageEvent {
-    ts: DateTime<Utc>,
-    tokens: u64,
-    /// Normalized model family ("Opus" / "Sonnet" / "Haiku") when the log
-    /// line names a known model; None for unrecognized model strings.
-    family: Option<&'static str>,
+/// The app's own Claude session (Credential Manager).
+fn stored_session() -> Option<Session> {
+    let blob = crate::secrets::oauth_get_json("claude")?;
+    let oauth = blob.get("claudeAiOauth")?;
+    let token = oauth
+        .get("accessToken")
+        .and_then(|t| t.as_str())
+        .filter(|t| !t.is_empty())?
+        .to_string();
+    let plan = plan_label(
+        oauth.get("subscriptionType").and_then(|s| s.as_str()),
+        oauth.get("rateLimitTier").and_then(|s| s.as_str()),
+    );
+    Some(Session { token, plan })
 }
 
-struct ClaudeCache {
-    files: HashMap<PathBuf, FileCursor>,
-    events: Vec<UsageEvent>,
-}
-
-fn claude_cache() -> &'static Mutex<ClaudeCache> {
-    static CACHE: OnceLock<Mutex<ClaudeCache>> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        Mutex::new(ClaudeCache {
-            files: HashMap::new(),
-            events: Vec::new(),
-        })
+/// "max" + "default_claude_max_5x" → "Max 5x"; "pro" → "Pro".
+fn plan_label(subscription: Option<&str>, tier: Option<&str>) -> Option<String> {
+    let sub = subscription.filter(|s| !s.is_empty())?;
+    let mut name = sub.to_string();
+    if let Some(first) = name.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    let multiplier = tier
+        .and_then(|t| t.rsplit('_').next())
+        .filter(|m| m.len() > 1 && m.ends_with('x') && m[..m.len() - 1].chars().all(|c| c.is_ascii_digit()));
+    Some(match multiplier {
+        Some(m) => format!("{name} {m}"),
+        None => name,
     })
 }
 
-/// Token counts come from per-message `usage` blocks in
-/// `~/.claude/projects/**/*.jsonl`. The Claude CLI does not publish rate
-/// limits, so we surface raw trailing-window totals (popup-only, since
-/// there is no % to plot). `history.jsonl` is just user prompt titles, no
-/// usage data — we skip it.
-///
-/// Reads are incremental: each file keeps a byte cursor, and only appended
-/// bytes are parsed on subsequent ticks. Events older than 7 days are pruned.
-fn read_claude_snapshot() -> Result<UsageSnapshot, String> {
-    let home = dirs::home_dir().ok_or("no home directory")?;
-    let projects_dir = home.join(".claude").join("projects");
-    if !projects_dir.exists() {
-        // Soft empty state — surface only in the popup so the bar segment
-        // doesn't go red for users without a ~/.claude directory.
-        if let Ok(mut cache) = claude_cache().lock() {
-            cache.files.clear();
-            cache.events.clear();
-        }
-        return Ok(UsageSnapshot {
-            provider: PROVIDER_LABEL.to_string(),
-            level: None,
-            windows: Vec::new(),
-            unavailable_reason: Some("no local claude data".into()),
-            fetched_at: Utc::now(),
-        });
+async fn fetch_live_windows(token: &str) -> Result<Vec<UsageWindow>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(LIVE_TIMEOUT)
+        .build()
+        .map_err(|e| format!("network error: client: {e}"))?;
+    let resp = client
+        .get(USAGE_URL)
+        .bearer_auth(token)
+        .header("Accept", "application/json")
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .send()
+        .await
+        .map_err(|e| format!("network error: {e}"))?;
+
+    let status = resp.status();
+    if matches!(status.as_u16(), 401 | 403) {
+        return Err(REASON_EXPIRED.into());
     }
-
-    let files = find_jsonl_files(&projects_dir, 3);
-    if files.is_empty() {
-        if let Ok(mut cache) = claude_cache().lock() {
-            cache.files.clear();
-            cache.events.clear();
-        }
-        return Ok(soft_empty("no local claude data"));
+    if !status.is_success() {
+        return Err(format!("claude usage http {status}"));
     }
-
-    let now = Utc::now();
-    let w5h = now - Duration::hours(5);
-    let w7d = now - Duration::days(7);
-
-    let mut cache = claude_cache()
-        .lock()
-        .map_err(|_| "claude cache lock poisoned".to_string())?;
-
-    // Drop cursors for files that disappeared.
-    let live: std::collections::HashSet<PathBuf> = files.iter().cloned().collect();
-    cache.files.retain(|path, _| live.contains(path));
-
-    // Truncation / rewrite would double-count if we only re-tailed that file while
-    // keeping old events. Full rebuild is rare and still tail-capped.
-    let truncated = files.iter().any(|path| {
-        let Ok(meta) = std::fs::metadata(path) else {
-            return false;
-        };
-        match cache.files.get(path) {
-            Some(c) => meta.len() < c.len,
-            None => false,
-        }
-    });
-    if truncated {
-        cache.files.clear();
-        cache.events.clear();
-    }
-
-    for path in &files {
-        let meta = match std::fs::metadata(path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let len = meta.len();
-        let cursor = cache.files.get(path).copied();
-
-        let start = match cursor {
-            Some(c) if c.len == len && c.offset == len => {
-                // Unchanged — skip.
-                continue;
-            }
-            Some(c) if len >= c.len && c.offset <= len => {
-                // Append-only growth (or same len with unread gap): read suffix.
-                c.offset
-            }
-            Some(_) | None => {
-                // New file or first sight — tail-cap cold start so we never
-                // re-slurp multi-hundred-MB histories in full.
-                if len > MAX_TAIL_BYTES {
-                    len - MAX_TAIL_BYTES
-                } else {
-                    0
-                }
-            }
-        };
-
-        if start >= len {
-            cache.files.insert(path.clone(), FileCursor { offset: len, len });
-            continue;
-        }
-
-        let mut file = match std::fs::File::open(path) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        if file.seek(SeekFrom::Start(start)).is_err() {
-            continue;
-        }
-        let mut buf = String::new();
-        if file.read_to_string(&mut buf).is_err() {
-            continue;
-        }
-
-        // When starting mid-file (tail cap), drop a partial first line.
-        let text = if start > 0 {
-            match buf.find('\n') {
-                Some(i) => &buf[i + 1..],
-                None => "",
-            }
-        } else {
-            buf.as_str()
-        };
-
-        for line in text.lines() {
-            if let Some(ev) = parse_usage_line(line) {
-                if ev.ts >= w7d {
-                    cache.events.push(ev);
-                }
-            }
-        }
-
-        cache.files.insert(
-            path.clone(),
-            FileCursor {
-                offset: len,
-                len,
-            },
-        );
-    }
-
-    // Age out events that fell outside the 7-day window.
-    cache.events.retain(|e| e.ts >= w7d);
-
-    let mut t5h: u64 = 0;
-    let mut t7d: u64 = 0;
-    let mut oldest_5h: Option<DateTime<Utc>> = None;
-    let mut oldest_7d: Option<DateTime<Utc>> = None;
-    let mut hits = 0usize;
-    // Per-model 7d token totals, keyed by normalized family name.
-    let mut by_family: HashMap<&'static str, u64> = HashMap::new();
-
-    for ev in &cache.events {
-        hits += 1;
-        if ev.ts >= w5h {
-            t5h += ev.tokens;
-            oldest_5h = Some(oldest_5h.map_or(ev.ts, |prev| prev.min(ev.ts)));
-        }
-        if ev.ts >= w7d {
-            t7d += ev.tokens;
-            oldest_7d = Some(oldest_7d.map_or(ev.ts, |prev| prev.min(ev.ts)));
-            if let Some(family) = ev.family {
-                *by_family.entry(family).or_insert(0) += ev.tokens;
-            }
-        }
-    }
-
-    // Drop the lock before building the snapshot (no need to hold it).
-    drop(cache);
-
-    if hits == 0 {
-        return Ok(soft_empty("no local claude data"));
-    }
-
-    let mut windows: Vec<UsageWindow> = Vec::new();
-    if t5h > 0 {
-        windows.push(UsageWindow {
-            label: format!("5h · {}K", t5h / 1000),
-            used_percent: 0.0,
-            reset_at: oldest_5h.map(|t| t + Duration::hours(5)),
-            bar_visible: false,
-            is_unlimited: false,
-            used_absolute: None,
-            limit_absolute: None,
-        });
-    }
-    if t7d > 0 {
-        windows.push(UsageWindow {
-            label: format!("7d · {}M", t7d / 1_000_000),
-            used_percent: 0.0,
-            reset_at: oldest_7d.map(|t| t + Duration::days(7)),
-            bar_visible: false,
-            is_unlimited: false,
-            used_absolute: None,
-            limit_absolute: None,
-        });
-        // Per-model split (Opus vs Sonnet vs Haiku), heaviest first.
-        let mut families: Vec<(&'static str, u64)> = by_family.into_iter().collect();
-        families.sort_by(|a, b| b.1.cmp(&a.1));
-        for (family, tokens) in families {
-            if tokens == 0 {
-                continue;
-            }
-            windows.push(UsageWindow {
-                label: format!("7d {family} · {}", format_token_count(tokens)),
-                used_percent: 0.0,
-                reset_at: oldest_7d.map(|t| t + Duration::days(7)),
-                bar_visible: false,
-                is_unlimited: false,
-                used_absolute: Some(tokens as f64),
-                limit_absolute: None,
-            });
-        }
-    }
-
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("claude usage decode: {e}"))?;
+    let windows = parse_live_usage(&body);
     if windows.is_empty() {
-        // Had older history but nothing in the trailing windows.
-        return Ok(soft_empty("no recent usage"));
+        return Err("claude usage decode: no 5h/weekly windows in response".into());
     }
+    Ok(windows)
+}
 
-    Ok(UsageSnapshot {
-        provider: PROVIDER_LABEL.to_string(),
-        level: None,
-        windows,
-        unavailable_reason: None,
-        fetched_at: Utc::now(),
+/// Optional per-model / per-surface weekly caps. Plans that have one return an
+/// object for the key; plans without return null and nothing is shown.
+const OPTIONAL_WEEKLY: [(&str, &str); 4] = [
+    ("seven_day_sonnet", "Sonnet"),
+    ("seven_day_opus", "Opus"),
+    ("seven_day_cowork", "Cowork"),
+    ("seven_day_oauth_apps", "OAuth Apps"),
+];
+
+/// Turn the usage response into windows, showing only what the account has:
+///
+/// * `five_hour` / `seven_day` → "5h" / "weekly" bar windows (`utilization` is
+///   percent used 0–100; `resets_at` is null until the window has started).
+/// * `seven_day_sonnet` etc. → popup-only "weekly <Model>" windows, when non-null.
+/// * `extra_usage` → popup-only "this month $used / $cap" credits row, only
+///   when enabled or already spent.
+/// * `seven_day_breakdown` → popup-only "mix …" text row (share of weekly use).
+fn parse_live_usage(v: &serde_json::Value) -> Vec<UsageWindow> {
+    let mut out = Vec::new();
+    for (key, label) in [("five_hour", "5h"), ("seven_day", "weekly")] {
+        if let Some(w) = live_window(v, key, label.to_string(), true) {
+            out.push(w);
+        }
+    }
+    // No primary windows means the payload is not what we expect; let the
+    // caller report a decode error instead of showing only extras.
+    if out.is_empty() {
+        return out;
+    }
+    for (key, name) in OPTIONAL_WEEKLY {
+        if let Some(w) = live_window(v, key, format!("weekly {name}"), false) {
+            out.push(w);
+        }
+    }
+    out.extend(parse_extra_usage(v));
+    out.extend(parse_weekly_mix(v));
+    out
+}
+
+fn live_window(
+    v: &serde_json::Value,
+    key: &str,
+    label: String,
+    bar_visible: bool,
+) -> Option<UsageWindow> {
+    let obj = v.get(key).filter(|o| o.is_object())?;
+    let util = obj.get("utilization").and_then(|u| u.as_f64())?;
+    let reset_at = obj
+        .get("resets_at")
+        .and_then(|r| r.as_str())
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+    Some(UsageWindow {
+        label,
+        used_percent: util.clamp(0.0, 100.0) as f32,
+        reset_at,
+        bar_visible,
+        is_unlimited: false,
+        used_absolute: None,
+        limit_absolute: None,
     })
 }
 
-fn parse_usage_line(line: &str) -> Option<UsageEvent> {
-    let line = line.trim();
-    if line.is_empty() {
+/// Pay-as-you-go overflow credits. Amounts are minor units (`decimal_places`).
+fn parse_extra_usage(v: &serde_json::Value) -> Option<UsageWindow> {
+    let e = v.get("extra_usage").filter(|o| o.is_object())?;
+    let enabled = e.get("is_enabled").and_then(|b| b.as_bool()).unwrap_or(false);
+    let used_minor = e.get("used_credits").and_then(|n| n.as_f64()).unwrap_or(0.0);
+    if !enabled && used_minor <= 0.0 {
         return None;
     }
-    let entry: SessionEntry = serde_json::from_str(line).ok()?;
-    // Only assistant messages carry `usage`.
-    let message = entry.message.as_ref()?;
-    if message.role.as_deref() != Some("assistant") {
-        return None;
-    }
-    let usage = message.usage.as_ref()?;
-    let total = usage.input_tokens.unwrap_or(0)
-        + usage.output_tokens.unwrap_or(0)
-        + usage.cache_creation_input_tokens.unwrap_or(0)
-        + usage.cache_read_input_tokens.unwrap_or(0);
-    if total == 0 {
-        return None;
-    }
-    let ts = entry
-        .timestamp
-        .as_deref()
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&Utc))?;
-    let family = message.model.as_deref().and_then(model_family);
-    Some(UsageEvent { ts, tokens: total, family })
-}
-
-/// Map a raw model string ("claude-opus-4-1", "claude-sonnet-4-5-20250929")
-/// to its family. Unknown models return None — they stay in the totals but
-/// get no per-model row.
-fn model_family(model: &str) -> Option<&'static str> {
-    let m = model.to_ascii_lowercase();
-    if m.contains("opus") {
-        Some("Opus")
-    } else if m.contains("sonnet") {
-        Some("Sonnet")
-    } else if m.contains("haiku") {
-        Some("Haiku")
-    } else {
-        None
-    }
-}
-
-/// Adaptive token count for window labels: "12M" at/above a million, "345K"
-/// below (mirrors the aggregate 5h/7d label units).
-fn format_token_count(tokens: u64) -> String {
-    if tokens >= 1_000_000 {
-        format!("{}M", tokens / 1_000_000)
-    } else {
-        format!("{}K", tokens / 1_000)
-    }
-}
-
-/// Soft empty state — usable for "no data" / "no files" / "no recent
-/// usage". Kept as a snapshot (not Err) so the caller can decide whether
-/// to surface it as a popup hint or treat it as an empty bar segment.
-fn soft_empty(reason: &str) -> UsageSnapshot {
-    UsageSnapshot {
-        provider: PROVIDER_LABEL.to_string(),
-        level: None,
-        windows: Vec::new(),
-        unavailable_reason: Some(reason.into()),
-        fetched_at: Utc::now(),
-    }
-}
-
-fn find_jsonl_files(dir: &Path, max_depth: usize) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    if max_depth == 0 {
-        return files;
-    }
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return files,
+    let scale = 10f64.powi(e.get("decimal_places").and_then(|n| n.as_i64()).unwrap_or(2) as i32);
+    let used = used_minor / scale;
+    let limit = e
+        .get("monthly_limit")
+        .and_then(|n| n.as_f64())
+        .filter(|l| *l > 0.0)
+        .map(|l| l / scale);
+    let percent = e
+        .get("utilization")
+        .and_then(|n| n.as_f64())
+        .or_else(|| limit.map(|l| used / l * 100.0))
+        .unwrap_or(0.0);
+    let label = match limit {
+        Some(l) => format!("this month ${used:.2} / ${l:.2}"),
+        None => format!("this month ${used:.2}"),
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-            // history.jsonl is prompt titles only — no usage blocks.
-            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if name.eq_ignore_ascii_case("history.jsonl") {
-                continue;
-            }
-            files.push(path);
-        } else if path.is_dir() {
-            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if matches!(name, "node_modules" | ".git" | "target" | "debug-log") {
-                continue;
-            }
-            files.extend(find_jsonl_files(&path, max_depth - 1));
-        }
+    Some(UsageWindow {
+        label,
+        used_percent: percent.clamp(0.0, 100.0) as f32,
+        reset_at: None,
+        bar_visible: false,
+        is_unlimited: false,
+        used_absolute: Some(used),
+        limit_absolute: limit,
+    })
+}
+
+/// Which surfaces consumed the weekly pool ("Claude Code 40% · Chats 60%").
+/// A share, not a limit, so it is carried as text in the label.
+fn parse_weekly_mix(v: &serde_json::Value) -> Option<UsageWindow> {
+    let rows = v.pointer("/seven_day_breakdown/rows")?.as_array()?;
+    let parts: Vec<String> = rows
+        .iter()
+        .filter_map(|r| {
+            let name = r.get("display_name")?.as_str()?;
+            let pct = r.get("percent")?.as_f64()?;
+            (pct > 0.0).then(|| format!("{name} {pct:.0}%"))
+        })
+        .collect();
+    if parts.is_empty() {
+        return None;
     }
-    files
-}
-
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct SessionEntry {
-    timestamp: Option<String>,
-    message: Option<Message>,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct Message {
-    role: Option<String>,
-    model: Option<String>,
-    usage: Option<Usage>,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct Usage {
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
-    cache_creation_input_tokens: Option<u64>,
-    cache_read_input_tokens: Option<u64>,
+    Some(UsageWindow {
+        label: format!("mix {}", parts.join(" · ")),
+        used_percent: 0.0,
+        reset_at: None,
+        bar_visible: false,
+        is_unlimited: false,
+        used_absolute: None,
+        limit_absolute: None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::ProviderHealth;
 
     #[test]
-    fn model_family_maps_known_models() {
-        assert_eq!(model_family("claude-opus-4-1"), Some("Opus"));
-        assert_eq!(model_family("claude-sonnet-4-5-20250929"), Some("Sonnet"));
-        assert_eq!(model_family("claude-haiku-3-5"), Some("Haiku"));
-        assert_eq!(model_family("CLAUDE-OPUS-4-20250514"), Some("Opus"));
-        assert_eq!(model_family("some-other-model"), None);
+    fn live_usage_maps_five_hour_and_weekly_to_bar_windows() {
+        let v = serde_json::json!({
+            "five_hour": { "utilization": 37.0, "resets_at": "2026-09-30T20:00:00+00:00" },
+            "seven_day": { "utilization": 12, "resets_at": "2026-10-04T09:00:00.123456+00:00" },
+            "seven_day_opus": null
+        });
+        let w = parse_live_usage(&v);
+        assert_eq!(w.len(), 2);
+        assert_eq!(w[0].label, "5h");
+        assert!((w[0].used_percent - 37.0).abs() < 0.001);
+        assert!(w[0].bar_visible && w[0].reset_at.is_some());
+        assert_eq!(w[1].label, "weekly");
+        assert!((w[1].used_percent - 12.0).abs() < 0.001);
+        assert!(w[1].reset_at.is_some());
     }
 
     #[test]
-    fn format_token_count_picks_units() {
-        assert_eq!(format_token_count(12_345_678), "12M");
-        assert_eq!(format_token_count(1_000_000), "1M");
-        assert_eq!(format_token_count(345_678), "345K");
-        assert_eq!(format_token_count(999), "0K");
+    fn live_usage_keeps_window_without_reset_time_and_clamps() {
+        let v = serde_json::json!({
+            "five_hour": { "utilization": 140.0, "resets_at": null }
+        });
+        let w = parse_live_usage(&v);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].used_percent, 100.0);
+        assert!(w[0].reset_at.is_none());
     }
 
     #[test]
-    fn parse_usage_line_extracts_model_family() {
-        let line = r#"{
-            "timestamp": "2026-07-18T12:00:00Z",
-            "message": {
-                "role": "assistant",
-                "model": "claude-opus-4-1",
-                "usage": { "input_tokens": 10, "output_tokens": 5 }
-            }
-        }"#;
-        let ev = parse_usage_line(line).expect("usage event");
-        assert_eq!(ev.tokens, 15);
-        assert_eq!(ev.family, Some("Opus"));
+    fn live_usage_ignores_unknown_or_malformed_shapes() {
+        assert!(parse_live_usage(&serde_json::json!({})).is_empty());
+        assert!(parse_live_usage(&serde_json::json!({ "five_hour": null })).is_empty());
+        assert!(
+            parse_live_usage(&serde_json::json!({ "five_hour": { "utilization": "x" } }))
+                .is_empty()
+        );
+    }
+
+    /// Shape captured from a real Max account (nulls for plans without the feature).
+    fn real_max_response() -> serde_json::Value {
+        serde_json::json!({
+            "extra_usage": {
+                "currency": "USD", "decimal_places": 2, "is_enabled": false,
+                "monthly_limit": 7500, "used_credits": 0.0, "utilization": 0.0,
+                "disabled_reason": "out_of_credits"
+            },
+            "five_hour": { "utilization": 43.0, "resets_at": "2026-09-30T18:59:59.782168+00:00" },
+            "seven_day": { "utilization": 4.0, "resets_at": "2026-10-06T11:59:59.782188+00:00" },
+            "seven_day_breakdown": { "rows": [
+                { "display_name": "Claude Code", "key": "claude_code", "percent": 40 },
+                { "display_name": "Chats", "key": "chat", "percent": 60 },
+                { "display_name": "Cowork", "key": "cowork", "percent": 0 },
+                { "display_name": "Other", "key": "other", "percent": 0 }
+            ]},
+            "seven_day_opus": null, "seven_day_sonnet": null,
+            "seven_day_cowork": null, "seven_day_oauth_apps": null
+        })
     }
 
     #[test]
-    fn parse_usage_line_without_model_keeps_tokens_but_no_family() {
-        let line = r#"{
-            "timestamp": "2026-07-18T12:00:00Z",
-            "message": {
-                "role": "assistant",
-                "usage": { "input_tokens": 7 }
-            }
-        }"#;
-        let ev = parse_usage_line(line).expect("usage event");
-        assert_eq!(ev.tokens, 7);
-        assert_eq!(ev.family, None);
+    fn real_account_shows_bars_and_mix_but_hides_unavailable_extras() {
+        let w = parse_live_usage(&real_max_response());
+        let labels: Vec<&str> = w.iter().map(|w| w.label.as_str()).collect();
+        assert_eq!(labels, ["5h", "weekly", "mix Claude Code 40% · Chats 60%"]);
+        assert!(w[0].bar_visible && w[1].bar_visible);
+        assert!(!w[2].bar_visible, "mix is popup-only");
     }
 
     #[test]
-    fn parse_usage_line_ignores_non_assistant_messages() {
-        let line = r#"{
-            "timestamp": "2026-07-18T12:00:00Z",
-            "message": { "role": "user", "model": "claude-opus-4-1" }
-        }"#;
-        assert!(parse_usage_line(line).is_none());
+    fn per_model_weekly_limits_appear_automatically_when_returned() {
+        let mut v = real_max_response();
+        v["seven_day_sonnet"] =
+            serde_json::json!({ "utilization": 22.0, "resets_at": "2026-10-06T11:59:59+00:00" });
+        let w = parse_live_usage(&v);
+        let sonnet = w.iter().find(|w| w.label == "weekly Sonnet").expect("sonnet row");
+        assert!(!sonnet.bar_visible);
+        assert!((sonnet.used_percent - 22.0).abs() < 0.001);
+        assert!(sonnet.reset_at.is_some());
+        assert!(w.iter().all(|w| w.label != "weekly Opus"));
+    }
+
+    #[test]
+    fn extra_usage_credits_appear_once_enabled_or_spent() {
+        let mut v = real_max_response();
+        v["extra_usage"]["is_enabled"] = serde_json::json!(true);
+        v["extra_usage"]["used_credits"] = serde_json::json!(1250.0);
+        v["extra_usage"]["utilization"] = serde_json::json!(16.7);
+        let w = parse_live_usage(&v);
+        let credits = w.iter().find(|w| w.label.starts_with("this month")).expect("credits row");
+        assert_eq!(credits.label, "this month $12.50 / $75.00");
+        assert!(!credits.bar_visible);
+        assert_eq!(credits.used_absolute, Some(12.5));
+        assert_eq!(credits.limit_absolute, Some(75.0));
+    }
+
+    #[test]
+    fn extras_alone_do_not_count_as_a_usable_payload() {
+        let v = serde_json::json!({
+            "seven_day_sonnet": { "utilization": 5.0, "resets_at": null }
+        });
+        assert!(parse_live_usage(&v).is_empty());
+    }
+
+    #[test]
+    fn plan_label_combines_plan_and_multiplier() {
+        assert_eq!(
+            plan_label(Some("max"), Some("default_claude_max_5x")).as_deref(),
+            Some("Max 5x")
+        );
+        assert_eq!(
+            plan_label(Some("max"), Some("default_claude_max_20x")).as_deref(),
+            Some("Max 20x")
+        );
+        assert_eq!(plan_label(Some("pro"), Some("default_claude_ai")).as_deref(), Some("Pro"));
+        assert_eq!(plan_label(Some("pro"), None).as_deref(), Some("Pro"));
+        assert_eq!(plan_label(None, Some("default_claude_max_5x")), None);
+    }
+
+    #[test]
+    fn expired_reason_classifies_as_invalid_credentials() {
+        let out = classify_snapshot(UsageSnapshot::unavailable(PROVIDER_LABEL, REASON_EXPIRED));
+        assert_eq!(out.health, ProviderHealth::InvalidCredentials);
+    }
+
+    #[test]
+    fn no_auth_reason_classifies_as_missing_credentials() {
+        let out = classify_snapshot(UsageSnapshot::unavailable(PROVIDER_LABEL, REASON_NO_AUTH));
+        assert_eq!(out.health, ProviderHealth::MissingCredentials);
+    }
+
+    #[test]
+    fn live_http_error_classifies_as_transient() {
+        let out = classify_snapshot(UsageSnapshot::unavailable(
+            PROVIDER_LABEL,
+            "claude usage http 429 Too Many Requests",
+        ));
+        assert_eq!(out.health, ProviderHealth::TransientFailure);
     }
 }

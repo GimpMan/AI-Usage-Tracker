@@ -70,6 +70,14 @@ assert.equal(
   formatDollarWindow({ label: "this month $0.2985" }),
   "$0.2985",
 );
+assert.equal(
+  formatDollarWindow({ label: "this month $12.50 / $75.00" }),
+  "$12.50 / $75.00",
+);
+assert.equal(
+  formatDollarWindow({ label: "mix Claude Code 40% · Chats 60%" }),
+  "Claude Code 40% · Chats 60%",
+);
 
 const ui = fs.readFileSync("src/settings-panel.tsx", "utf8");
 const css = fs.readFileSync("src/styles.css", "utf8");

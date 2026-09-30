@@ -53,6 +53,7 @@ import grokLogo from "./assets/grok-logo.png";
 import openrouterLogo from "./assets/openrouter-logo.png";
 import kimiLogo from "./assets/kimi-logo.png";
 import cursorLogo from "./assets/cursor-logo.png";
+import claudeLogo from "./assets/claude-logo.png";
 import brandLogo from "./assets/brand-logo.png";
 
 const currentWindow = getCurrentWindow();
@@ -389,7 +390,12 @@ function prettyLabel(label: string, provider?: string): string {
   if (l.startsWith("total ")) return "Total Credit Limit";
   if (l.startsWith("today ")) return "Today";
   if (l.startsWith("this week ")) return "This Week";
-  if (l.startsWith("this month ")) return "This Month";
+  if (l.startsWith("this month ")) {
+    return provider === "Claude Code" ? "Extra Usage This Month" : "This Month";
+  }
+  if (l.startsWith("mix ")) return "Weekly Mix";
+  // Claude per-model weekly caps ("weekly Sonnet") — not the paced "weekly" bar.
+  if (l.startsWith("weekly ")) return `Weekly · ${label.slice("weekly ".length)}`;
   if (l === "weekly" || l === "wk") return "Weekly";
   if (l === "daily") return "Daily";
   if (l === "monthly" || l === "mo")
@@ -594,16 +600,15 @@ function ProviderIcon({ id, size = 14 }: { id: string; size?: number }) {
         />
       );
     case "claude":
-      // Anthropic asterisk
+      // Official Claude mark (transparent PNG, bundled locally).
       return (
-        <svg {...common} fill="none">
-          <path
-            d="M12 3v18M5 7l14 10M5 17L19 7"
-            stroke="#d97757"
-            stroke-width="2.2"
-            stroke-linecap="round"
-          />
-        </svg>
+        <img
+          src={claudeLogo}
+          class="icon-svg"
+          style="object-fit:contain"
+          draggable={false}
+          alt="Claude Code"
+        />
       );
     case "grok":
       // Official Grok mark (inverted for dark UI).
@@ -1323,7 +1328,6 @@ function Popup({
           isFiveHourWindowUnderRedLine(w, snap.provider);
         // Absolute used/limit counters, shown inside "More details". Kimi
         // reports plain counters; OpenRouter reports USD — format as currency.
-        // Claude's per-model rows carry only used_absolute (exact tokens).
         // A /100 limit only restates the percentage already on the bar
         // ("43 / 100 used" ≡ "43% used") — hide that mirror on the paced
         // 5h/weekly windows; real counters (e.g. 250 / 1,000) stay.
@@ -1339,9 +1343,7 @@ function Popup({
               : percentMirror
                 ? null
                 : `${Math.round(w.used_absolute).toLocaleString()} / ${Math.round(w.limit_absolute).toLocaleString()} used`
-            : w.used_absolute != null && providerId === "claude"
-              ? `${Math.round(w.used_absolute).toLocaleString()} tokens`
-              : null;
+            : null;
         // OpenRouter monthly cap: linear month-end dollar projection.
         const extraNote = openrouterW ? dollarMonthlyProjectionNote(w) : null;
         return (
@@ -1350,7 +1352,9 @@ function Popup({
               <>
                 <div class="popup-section-head">
                   <span class="popup-section-label">{prettyLabel(w.label, snap.provider)}</span>
-                  <span class="popup-section-meta">Credit usage</span>
+                  <span class="popup-section-meta">
+                    {w.label.toLowerCase().startsWith("mix ") ? "Share of weekly use" : "Credit usage"}
+                  </span>
                 </div>
                 <div class="popup-section-foot">
                   <span>{dollarDetail}</span>

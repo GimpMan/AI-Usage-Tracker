@@ -52,7 +52,7 @@ const PROVIDERS: ProviderMeta[] = [
   {
     id: "claude",
     label: "Claude Code",
-    hint: "Sign in here (app session stored encrypted in Windows Credential Manager — separate from the Claude CLI). Requires Pro or Max. Shows recent local token use from project logs — not live rate-limit %.",
+    hint: "Sign in here (app session stored encrypted in Windows Credential Manager — separate from the Claude CLI). Requires Pro or Max. Shows your live 5-hour and weekly limits.",
     placeholder: "",
     oauth: true,
   },

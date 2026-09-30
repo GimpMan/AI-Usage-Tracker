@@ -62,5 +62,7 @@ export function formatDollarWindow(window: { label: string }): string | null {
   if (label.startsWith("today ")) return window.label.slice("today ".length);
   if (label.startsWith("this week ")) return window.label.slice("this week ".length);
   if (label.startsWith("this month ")) return window.label.slice("this month ".length);
+  // Claude: share of the weekly pool per surface, e.g. "Claude Code 40% · Chats 60%".
+  if (label.startsWith("mix ")) return window.label.slice("mix ".length);
   return null;
 }
