@@ -79,8 +79,14 @@ fn bottom_right(app: &AppHandle, w: f64, h: f64) -> (f64, f64) {
 /// Spawn (or focus) the overlay window.
 pub fn open_overlay(app: &AppHandle) -> tauri::Result<()> {
     if let Some(win) = app.get_webview_window(OVERLAY_LABEL) {
+        // Strip the native caption while the window is still hidden so the
+        // first frame after show() cannot include it, then re-apply as
+        // WebView2 repaints (restoring from the tray used to leave a title
+        // bar visible until the next click).
+        let _ = crate::win32::suppress_frame_repaint(&win);
+        let _ = crate::win32::enforce_borderless(&win);
         win.show()?;
-        crate::win32::enforce_borderless(&win).map_err(std::io::Error::other)?;
+        crate::win32::enforce_borderless_after_show(&win).map_err(std::io::Error::other)?;
         win.set_focus()?;
         return Ok(());
     }
@@ -120,6 +126,10 @@ pub fn open_overlay(app: &AppHandle) -> tauri::Result<()> {
         .initialization_script(DISABLE_BROWSER_CONTEXT_MENU)
         .build()?;
     crate::win32::enforce_borderless(&_win).map_err(std::io::Error::other)?;
+    // Never let Windows repaint a native frame on activation changes.
+    if let Err(e) = crate::win32::suppress_frame_repaint(&_win) {
+        log::warn!("suppress_frame_repaint: {e}");
+    }
     // Persist the bar's position whenever it goes away for good.
     // CloseRequested fires on X-button, Alt+F4, taskbar close, and the
     // OS-driven destroy during `quit_cleanly` — all paths the user can
@@ -135,6 +145,13 @@ pub fn open_overlay(app: &AppHandle) -> tauri::Result<()> {
         tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed => {
             if let Some(win) = app_handle.get_webview_window(OVERLAY_LABEL) {
                 persist_overlay_position(&win);
+            }
+        }
+        // Belt and braces for the frame-suppression hook: a focus change is
+        // when a stale native title bar used to reappear after a tray restore.
+        tauri::WindowEvent::Focused(_) => {
+            if let Some(win) = app_handle.get_webview_window(OVERLAY_LABEL) {
+                let _ = crate::win32::enforce_borderless_after_show(&win);
             }
         }
         _ => {}

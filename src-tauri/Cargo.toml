@@ -37,4 +37,4 @@ tauri-plugin-process = "2"
 custom-protocol = ["tauri/custom-protocol"]
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem"] }
+windows = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem"] }

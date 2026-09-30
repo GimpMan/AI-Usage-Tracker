@@ -32,6 +32,22 @@ assert.equal(
   true,
   "re-shown overlay windows must enforce the borderless Win32 style",
 );
+// Restoring from the tray: fix the style while still hidden, then keep
+// re-applying while WebView2 paints, or a native title bar stays visible
+// until the next click.
+const reshowEnforceIndex = existingWindowPath.indexOf("crate::win32::enforce_borderless(&win)");
+const reshowShowIndex = existingWindowPath.indexOf("win.show()?;");
+const reshowSettledIndex = existingWindowPath.indexOf(
+  "crate::win32::enforce_borderless_after_show(&win)",
+);
+assert.ok(
+  reshowEnforceIndex !== -1 && reshowEnforceIndex < reshowShowIndex,
+  "re-shown overlay must strip the caption style before show()",
+);
+assert.ok(
+  reshowSettledIndex > reshowShowIndex,
+  "re-shown overlay must schedule delayed borderless refreshes after show()",
+);
 assert.equal(
   newWindowPath.includes("crate::win32::enforce_borderless(&_win)"),
   true,
@@ -131,7 +147,8 @@ assert.match(
 );
 for (const required of [
   "tauri::async_runtime::spawn",
-  "Duration::from_millis(50)",
+  "Duration::from_millis(",
+  "schedule_borderless_refresh_at(window, &[50])",
   "enforce_borderless(&window)",
 ]) {
   assert.notEqual(
@@ -140,10 +157,53 @@ for (const required of [
     `delayed borderless refresh must contain ${required}`,
   );
 }
+const settledStart = win32Source.indexOf("pub fn enforce_borderless_after_show(");
+assert.notEqual(settledStart, -1, "post-show borderless helper must exist");
+const settledSource = win32Source.slice(settledStart, settledStart + 400);
+assert.match(
+  settledSource,
+  /enforce_borderless\(window\)\?;[\s\S]*schedule_borderless_refresh_at\(window\.clone\(\), &\[50, 250, 700\]\)/,
+  "post-show helper must enforce immediately and again after WebView2 paints",
+);
 assert.notEqual(
   regionSource.indexOf("schedule_borderless_refresh(window.clone())"),
   -1,
   "every region mutation must schedule the post-WebView2 frame refresh",
+);
+
+// After a tray restore Windows repainted a stale native title bar on every
+// activation change (focus moved away: bar appears; overlay clicked: gone).
+// The overlay has no frame by design, so a window-proc hook must stop
+// WM_NCACTIVATE / WM_NCPAINT from painting one.
+const hookStart = win32Source.indexOf("unsafe extern \"system\" fn no_frame_subclass_proc");
+assert.notEqual(hookStart, -1, "no-frame window-proc hook must exist");
+const hookSource = win32Source.slice(hookStart, hookStart + 900);
+assert.match(
+  hookSource,
+  /WM_NCACTIVATE\s*=>\s*DefSubclassProc\(hwnd,\s*msg,\s*wparam,\s*LPARAM\(-1\)\)/,
+  "WM_NCACTIVATE must be forwarded with lParam = -1 so the frame is not repainted",
+);
+assert.match(hookSource, /WM_NCPAINT\s*=>\s*LRESULT\(0\)/, "WM_NCPAINT must be swallowed");
+assert.equal(
+  win32Source.includes("pub fn suppress_frame_repaint("),
+  true,
+  "helper that installs the hook must exist",
+);
+assert.equal(
+  source.includes("crate::win32::suppress_frame_repaint(&_win)"),
+  true,
+  "new overlay windows must install the no-frame hook",
+);
+assert.ok(
+  existingWindowPath.includes("crate::win32::suppress_frame_repaint(&win)") &&
+    existingWindowPath.indexOf("crate::win32::suppress_frame_repaint(&win)") <
+      existingWindowPath.indexOf("win.show()?;"),
+  "re-shown overlay windows must have the no-frame hook before show()",
+);
+assert.match(
+  source,
+  /WindowEvent::Focused\(_\)\s*=>\s*\{[\s\S]*?enforce_borderless_after_show/,
+  "focus changes must re-apply borderless enforcement",
 );
 
 console.log("overlay borderless enforcement tests passed");

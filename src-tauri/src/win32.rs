@@ -51,16 +51,17 @@ mod windows_impl {
     use std::time::Duration;
 
     use tauri::Manager;
-    use windows::Win32::Foundation::{HWND, POINT, RECT};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         CreateRectRgn, GetMonitorInfoW, MonitorFromWindow, SetWindowRgn, MONITORINFO,
         MONITOR_DEFAULTTONEAREST,
     };
+    use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
     use windows::Win32::UI::WindowsAndMessaging::{
         GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, SetWindowLongPtrW,
         SetWindowPos, GWL_EXSTYLE, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-        SWP_NOSIZE, SWP_NOZORDER, WS_CAPTION, WS_EX_TRANSPARENT, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
-        WS_SYSMENU, WS_THICKFRAME,
+        SWP_NOSIZE, SWP_NOZORDER, WM_NCACTIVATE, WM_NCPAINT, WS_CAPTION, WS_EX_TRANSPARENT,
+        WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
     };
 
     /// Collapsed bar height in logical px — KEEP IN SYNC with `.bar { height }`
@@ -198,18 +199,79 @@ mod windows_impl {
     /// once that work settles. Epoch coalescing prevents rapid open/close
     /// region changes from stacking stale refreshes.
     fn schedule_borderless_refresh(window: tauri::WebviewWindow) {
+        schedule_borderless_refresh_at(window, &[50]);
+    }
+
+    /// Like `schedule_borderless_refresh`, with one refresh per delay (ms
+    /// after the call). A newer schedule supersedes any pending older one.
+    fn schedule_borderless_refresh_at(window: tauri::WebviewWindow, delays_ms: &'static [u64]) {
         let epoch = BORDERLESS_REFRESH_EPOCH
             .fetch_add(1, Ordering::SeqCst)
             .wrapping_add(1);
         tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            if BORDERLESS_REFRESH_EPOCH.load(Ordering::SeqCst) != epoch {
-                return;
-            }
-            if let Err(e) = enforce_borderless(&window) {
-                log::warn!("delayed borderless refresh failed: {e}");
+            let mut elapsed = 0;
+            for &delay in delays_ms {
+                tokio::time::sleep(Duration::from_millis(delay - elapsed)).await;
+                elapsed = delay;
+                if BORDERLESS_REFRESH_EPOCH.load(Ordering::SeqCst) != epoch {
+                    return;
+                }
+                if let Err(e) = enforce_borderless(&window) {
+                    log::warn!("delayed borderless refresh failed: {e}");
+                }
             }
         });
+    }
+
+    /// Window procedure hook that keeps Windows from ever painting a native
+    /// frame on the overlay. After a tray restore the HWND can carry a cached
+    /// title bar that Windows repaints on every activation change (visible
+    /// when focus moves to another window, gone again once the overlay is
+    /// clicked). The overlay has no non-client area by design, so:
+    /// * `WM_NCACTIVATE` still updates the active state but with lParam = -1,
+    ///   which tells DefWindowProc not to repaint the frame;
+    /// * `WM_NCPAINT` is swallowed.
+    unsafe extern "system" fn no_frame_subclass_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        _subclass_id: usize,
+        _ref_data: usize,
+    ) -> LRESULT {
+        match msg {
+            WM_NCACTIVATE => DefSubclassProc(hwnd, msg, wparam, LPARAM(-1)),
+            WM_NCPAINT => LRESULT(0),
+            _ => DefSubclassProc(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    const NO_FRAME_SUBCLASS_ID: usize = 0x4149_5554; // "AIUT"
+
+    /// Install [`no_frame_subclass_proc`] on the overlay. Idempotent: the same
+    /// proc + id pair is only ever registered once per HWND.
+    pub fn suppress_frame_repaint(window: &tauri::WebviewWindow) -> Result<(), String> {
+        let hwnd_raw = window.hwnd().map_err(|e| e.to_string())?;
+        let hwnd = HWND(hwnd_raw.0 as *mut _);
+        unsafe {
+            if !SetWindowSubclass(hwnd, Some(no_frame_subclass_proc), NO_FRAME_SUBCLASS_ID, 0)
+                .as_bool()
+            {
+                return Err("SetWindowSubclass(no frame) failed".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Borderless enforcement for a window that was just re-shown (tray
+    /// restore). Showing a hidden transparent WebView2 window can paint a
+    /// cached native title bar over the black, unpainted surface, and it stays
+    /// until something forces a frame recalculation (a click used to). Apply
+    /// the fix now, then again while WebView2 paints its first frames.
+    pub fn enforce_borderless_after_show(window: &tauri::WebviewWindow) -> Result<(), String> {
+        enforce_borderless(window)?;
+        schedule_borderless_refresh_at(window.clone(), &[50, 250, 700]);
+        Ok(())
     }
 
     /// Update the interactive content strip height (physical px from bottom)
